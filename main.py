@@ -24,6 +24,10 @@ except:
 # Variance EWS score — paper-validated metric (replaces deprecated coupling C)
 from variance_score import compute_variance_score, spearman_rho
 
+# Daily price data fetcher with Tiingo + Stooq fallback
+# (replaces yfinance for variance score input; yfinance kept as 3rd fallback)
+from price_data import fetch_daily_prices, fetch_basic_market_metadata
+
 app = FastAPI(
     title="ISC Analyst+ API",
     description="Full financial review powered by ISC coupling framework",
@@ -193,107 +197,166 @@ def compute_series_trajectory(series, window=6):
 
 # ── Market data ────────────────────────────────────────────────────────────────
 def get_market_data(ticker: str):
-    if not HAS_YF:
-        return {}
-    try:
-        tk = yf.Ticker(ticker)
-        info = tk.info
-        # Fetch 2y for variance score (needs 252+ trading days), tail(60) shown in chart
-        hist = tk.history(period='2y', auto_adjust=True)
-        price   = info.get('currentPrice') or info.get('regularMarketPrice')
-        high52  = info.get('fiftyTwoWeekHigh')
-        low52   = info.get('fiftyTwoWeekLow')
-        mktcap  = info.get('marketCap')
-
-        rsi = None
-        if len(hist) >= 15:
-            delta = hist['Close'].diff()
-            gain  = delta.where(delta > 0, 0).rolling(14).mean()
-            loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs    = gain / loss
-            val   = 100 - 100/(1+rs.iloc[-1])
-            rsi   = round(float(val), 1) if not np.isnan(val) else None
-
-        price_hist = []
-        full_price_series = None  # for variance score
-        if len(hist) > 0:
-            price_hist = [round(float(v), 2) for v in hist['Close'].tail(60).tolist() if not np.isnan(v)]
-            # Full series with date index for variance EWS computation
-            full_price_series = hist['Close'].copy()
-
-        atm_iv = otm_iv = None
+    """
+    Fetch market data with multi-source fallback chain:
+      1. Daily prices: Tiingo → Stooq (via price_data.fetch_daily_prices)
+      2. Basic metadata: Tiingo (via price_data.fetch_basic_market_metadata)
+      3. Bonus data (options IV, fund metrics): yfinance — accepts failure
+    
+    Returns the same dict shape as before. Fields not available from any source
+    return None and downstream code handles missing values gracefully.
+    """
+    out = {
+        'price': None, 'high_52w': None, 'low_52w': None, 'pct_52w': None,
+        'market_cap': None, 'market_cap_bn': None, 'market_cap_m': None,
+        'pe': None, 'pb': None, 'ev_ebitda': None, 'beta': None, 'rsi': None,
+        'sector': None, 'industry': None, 'company_name': ticker,
+        'description': '', 'price_history': [], 'full_price_series': None,
+        'atm_iv': None, 'otm_iv': None, 'iv_skew': None,
+        'total_revenue': None, 'ebitda': None, 'total_debt': None,
+        'free_cashflow': None, 'operating_cashflow': None,
+        'current_ratio': None, 'quick_ratio': None, 'debt_to_equity': None,
+        'roe': None, 'roa': None, 'gross_margins': None, 'op_margins': None,
+        'profit_margins': None, 'revenue_growth': None, 'earnings_growth': None,
+        'shares_outstanding': None, 'dividend_yield': None,
+        'eps_trailing': None, 'book_value': None,
+        'price_source': 'failed',
+    }
+    
+    # 1. Daily prices via Tiingo→Stooq fallback chain
+    full_prices, price_source = fetch_daily_prices(ticker, days=730)
+    out['price_source'] = price_source
+    
+    if full_prices is not None and len(full_prices) > 0:
+        out['full_price_series'] = full_prices
+        # Tail 60 for chart
         try:
-            expiries = tk.options
-            if expiries and price:
-                chain = tk.option_chain(expiries[0])
-                calls = chain.calls.copy()
-                puts  = chain.puts.copy()
-                if not calls.empty:
-                    calls['dist'] = abs(calls['strike'] - price)
-                    iv = calls.loc[calls['dist'].idxmin(), 'impliedVolatility']
-                    atm_iv = round(float(iv)*100, 1) if not np.isnan(float(iv)) else None
-                if not puts.empty and price:
-                    puts['dist'] = abs(puts['strike'] - price*0.90)
-                    iv2 = puts.loc[puts['dist'].idxmin(), 'impliedVolatility']
-                    otm_iv = round(float(iv2)*100, 1) if not np.isnan(float(iv2)) else None
-        except:
+            tail = full_prices.tail(60).tolist()
+            out['price_history'] = [round(float(v), 2) for v in tail if v is not None and not np.isnan(v)]
+        except Exception:
+            out['price_history'] = []
+        
+        # Latest price
+        try:
+            out['price'] = round(float(full_prices.iloc[-1]), 2)
+        except Exception:
             pass
-
-        def safe_round(v, d=2):
+        
+        # 52-week high/low from price series (last 252 trading days)
+        try:
+            window = full_prices.tail(252)
+            out['high_52w'] = round(float(window.max()), 2)
+            out['low_52w'] = round(float(window.min()), 2)
+            if out['high_52w'] != out['low_52w'] and out['price'] is not None:
+                out['pct_52w'] = round(((out['price'] - out['low_52w']) / (out['high_52w'] - out['low_52w'])) * 100, 1)
+        except Exception:
+            pass
+        
+        # RSI from full series
+        try:
+            if len(full_prices) >= 15:
+                delta = full_prices.diff()
+                gain = delta.where(delta > 0, 0).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain / loss
+                rsi_val = 100 - 100 / (1 + rs.iloc[-1])
+                if not (np.isnan(rsi_val) or np.isinf(rsi_val)):
+                    out['rsi'] = round(float(rsi_val), 1)
+        except Exception:
+            pass
+    
+    # 2. Tiingo metadata (company name, description) — overrides defaults if available
+    try:
+        meta = fetch_basic_market_metadata(ticker)
+        if meta.get('company_name'):
+            out['company_name'] = meta['company_name']
+        if meta.get('description'):
+            out['description'] = meta['description']
+        # Tiingo basic metadata doesn't include sector/industry/marketCap (paid plan)
+    except Exception:
+        pass
+    
+    # 3. Bonus data via yfinance — accepts failure entirely
+    if HAS_YF:
+        try:
+            tk = yf.Ticker(ticker)
+            info = tk.info
+            
+            def safe_round(v, d=2):
+                try:
+                    f = float(v)
+                    return round(f, d) if not np.isnan(f) and not np.isinf(f) else None
+                except:
+                    return None
+            
+            # Only overwrite fields we don't already have from primary sources
+            if not out.get('sector'):
+                out['sector'] = info.get('sector')
+            if not out.get('industry'):
+                out['industry'] = info.get('industry')
+            if not out.get('description'):
+                desc = info.get('longBusinessSummary') or ''
+                out['description'] = desc[:300] if desc else ''
+            
+            mktcap = info.get('marketCap')
+            if mktcap:
+                out['market_cap'] = mktcap
+                out['market_cap_bn'] = safe_round(mktcap/1e9, 2)
+                out['market_cap_m'] = safe_round(mktcap/1e6, 1)
+            
+            out['pe'] = safe_round(info.get('trailingPE'), 1)
+            out['pb'] = safe_round(info.get('priceToBook'), 2)
+            out['ev_ebitda'] = safe_round(info.get('enterpriseToEbitda'), 1)
+            out['beta'] = safe_round(info.get('beta'), 2)
+            out['total_revenue'] = safe_round(info.get('totalRevenue'), 0)
+            out['ebitda'] = safe_round(info.get('ebitda'), 0)
+            out['total_debt'] = safe_round(info.get('totalDebt'), 0)
+            out['free_cashflow'] = safe_round(info.get('freeCashflow'), 0)
+            out['operating_cashflow'] = safe_round(info.get('operatingCashflow'), 0)
+            out['current_ratio'] = safe_round(info.get('currentRatio'), 2)
+            out['quick_ratio'] = safe_round(info.get('quickRatio'), 2)
+            out['debt_to_equity'] = safe_round(info.get('debtToEquity'), 2)
+            out['roe'] = safe_round(info.get('returnOnEquity'), 4)
+            out['roa'] = safe_round(info.get('returnOnAssets'), 4)
+            out['gross_margins'] = safe_round(info.get('grossMargins'), 4)
+            out['op_margins'] = safe_round(info.get('operatingMargins'), 4)
+            out['profit_margins'] = safe_round(info.get('profitMargins'), 4)
+            out['revenue_growth'] = safe_round(info.get('revenueGrowth'), 4)
+            out['earnings_growth'] = safe_round(info.get('earningsGrowth'), 4)
+            out['shares_outstanding'] = info.get('sharesOutstanding')
+            out['dividend_yield'] = safe_round(info.get('dividendYield'), 4)
+            out['eps_trailing'] = safe_round(info.get('trailingEps'), 2)
+            out['book_value'] = safe_round(info.get('bookValue'), 2)
+            
+            # Override company name if Tiingo didn't get it
+            if not out.get('company_name') or out['company_name'] == ticker:
+                out['company_name'] = info.get('longName') or info.get('shortName') or ticker
+            
+            # Options IV
             try:
-                f = float(v)
-                return round(f, d) if not np.isnan(f) and not np.isinf(f) else None
-            except:
-                return None
-
-        pct52 = None
-        if all([price, high52, low52]) and high52 != low52:
-            pct52 = round(((price-low52)/(high52-low52))*100, 1)
-
-        return {
-            'price':         safe_round(price, 2),
-            'high_52w':      safe_round(high52, 2),
-            'low_52w':       safe_round(low52, 2),
-            'pct_52w':       pct52,
-            'market_cap':    mktcap,
-            'market_cap_bn': safe_round(mktcap/1e9, 2) if mktcap else None,
-            'market_cap_m':  safe_round(mktcap/1e6, 1) if mktcap else None,
-            'pe':            safe_round(info.get('trailingPE'), 1),
-            'pb':            safe_round(info.get('priceToBook'), 2),
-            'ev_ebitda':     safe_round(info.get('enterpriseToEbitda'), 1),
-            'beta':          safe_round(info.get('beta'), 2),
-            'rsi':           rsi,
-            'sector':        info.get('sector'),
-            'industry':      info.get('industry'),
-            'company_name':  info.get('longName') or info.get('shortName') or ticker,
-            'description':   (info.get('longBusinessSummary') or '')[:300],
-            'price_history': price_hist,
-            'full_price_series': full_price_series,  # for variance score; not in JSON output
-            'atm_iv':        atm_iv,
-            'otm_iv':        otm_iv,
-            'iv_skew':       round(otm_iv-atm_iv, 1) if (atm_iv and otm_iv) else None,
-            'total_revenue': safe_round(info.get('totalRevenue'), 0),
-            'ebitda':        safe_round(info.get('ebitda'), 0),
-            'total_debt':    safe_round(info.get('totalDebt'), 0),
-            'free_cashflow': safe_round(info.get('freeCashflow'), 0),
-            'operating_cashflow': safe_round(info.get('operatingCashflow'), 0),
-            'current_ratio': safe_round(info.get('currentRatio'), 2),
-            'quick_ratio':   safe_round(info.get('quickRatio'), 2),
-            'debt_to_equity':safe_round(info.get('debtToEquity'), 2),
-            'roe':           safe_round(info.get('returnOnEquity'), 4),
-            'roa':           safe_round(info.get('returnOnAssets'), 4),
-            'gross_margins': safe_round(info.get('grossMargins'), 4),
-            'op_margins':    safe_round(info.get('operatingMargins'), 4),
-            'profit_margins':safe_round(info.get('profitMargins'), 4),
-            'revenue_growth':safe_round(info.get('revenueGrowth'), 4),
-            'earnings_growth':safe_round(info.get('earningsGrowth'), 4),
-            'shares_outstanding': info.get('sharesOutstanding'),
-            'dividend_yield': safe_round(info.get('dividendYield'), 4),
-            'eps_trailing':  safe_round(info.get('trailingEps'), 2),
-            'book_value':    safe_round(info.get('bookValue'), 2),
-        }
-    except Exception as e:
-        return {'error': str(e)}
+                expiries = tk.options
+                price = out.get('price')
+                if expiries and price:
+                    chain = tk.option_chain(expiries[0])
+                    calls = chain.calls.copy()
+                    puts = chain.puts.copy()
+                    if not calls.empty:
+                        calls['dist'] = abs(calls['strike'] - price)
+                        iv = calls.loc[calls['dist'].idxmin(), 'impliedVolatility']
+                        out['atm_iv'] = round(float(iv)*100, 1) if not np.isnan(float(iv)) else None
+                    if not puts.empty:
+                        puts['dist'] = abs(puts['strike'] - price*0.90)
+                        iv2 = puts.loc[puts['dist'].idxmin(), 'impliedVolatility']
+                        out['otm_iv'] = round(float(iv2)*100, 1) if not np.isnan(float(iv2)) else None
+                    if out['atm_iv'] and out['otm_iv']:
+                        out['iv_skew'] = round(out['otm_iv'] - out['atm_iv'], 1)
+            except Exception:
+                pass
+        except Exception:
+            # yfinance failure is fine — we already have prices from Tiingo/Stooq
+            pass
+    
+    return out
 
 # ── Traditional metrics ────────────────────────────────────────────────────────
 def safe_div(a, b):
@@ -608,7 +671,8 @@ async def analyze(ticker: str, window: int = 6):
         'analysis_date':str(pd.Timestamp.now().date()),
         'data_sources': {
             'edgar': facts is not None,
-            'yfinance': bool(mkt.get('price')),
+            'yfinance': bool(mkt.get('price')) and HAS_YF,  # legacy field for frontend compat
+            'prices': mkt.get('price_source', 'failed'),    # 'tiingo' | 'stooq' | 'failed'
         },
 
         'isc': {
