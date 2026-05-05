@@ -21,6 +21,9 @@ try:
 except:
     HAS_YF = False
 
+# Variance EWS score — paper-validated metric (replaces deprecated coupling C)
+from variance_score import compute_variance_score, spearman_rho
+
 app = FastAPI(
     title="ISC Analyst+ API",
     description="Full financial review powered by ISC coupling framework",
@@ -125,32 +128,68 @@ def extract_series(facts, key, n=20):
             return s[~s.index.duplicated(keep='last')]
     return pd.Series(dtype=float)
 
-# ── ISC coupling ───────────────────────────────────────────────────────────────
-def compute_coupling(series, window=6):
+# ── Per-series trajectory (replaces deprecated compute_coupling) ──────────────
+# 
+# DEPRECATED: compute_coupling() previously computed C = corr(Var_W, AR1_W) on
+# quarterly fundamental series. Per Malone 2026 (Filter Collapse paper, P07),
+# this metric has near-zero correlation in finance (r=0.039, CI [0.035,0.043],
+# N=8,785) and joint variance/AR1 criteria yield AUC=0.51-0.60 in finance vs
+# variance-only AUC=0.86-0.88. The coupling metric was both statistically
+# meaningless on n=4-20 quarterly samples AND paper-disconfirmed for finance.
+#
+# The product now uses compute_variance_score() (price-based, paper-validated,
+# AUC=0.86-0.96) for the primary structural signal. Per-series fundamentals are
+# preserved here for trajectory and level analysis only — no C correlation.
+
+def compute_series_trajectory(series, window=6):
+    """
+    Analyze a quarterly fundamental series without computing the deprecated
+    coupling C correlation. Returns trajectory metrics that ARE statistically
+    meaningful on small quarterly samples.
+    
+    Returns:
+      {
+        'latest':      most recent observed value,
+        'trend_rho':   Spearman correlation with time (-1 to +1),
+        'pct_change':  total percent change first to last,
+        'avg':         mean across the series,
+        'n':           number of observations,
+        'direction':   'rising' | 'falling' | 'flat' (based on rho)
+      }
+    Returns None if insufficient data.
+    """
     s = series.dropna() if series is not None else pd.Series()
-    if len(s) < window + 3:
+    if len(s) < 4:
         return None
-    var_w = s.rolling(window).var()
-    def ar1(x):
-        x = pd.Series(x)
-        return float(x.autocorr(lag=1)) if x.std() > 1e-10 else 0.0
-    ar1_w = s.rolling(window).apply(ar1, raw=False)
-    valid = pd.DataFrame({'var': var_w, 'ar1': ar1_w}).dropna()
-    if len(valid) < 4:
-        return None
-    C = float(valid['var'].corr(valid['ar1']))
-    if np.isnan(C):
-        return None
-    traj = []
-    for i in range(window, len(valid)):
-        chunk = valid.iloc[max(0,i-window):i]
-        if len(chunk) >= 3 and chunk['var'].std() > 0 and chunk['ar1'].std() > 0:
-            c = float(chunk['var'].corr(chunk['ar1']))
-            traj.append(round(c, 4) if not np.isnan(c) else (traj[-1] if traj else 0))
-        else:
-            traj.append(traj[-1] if traj else 0)
-    regime = 'regulated' if C < -0.10 else 'bifurcating' if C > 0.30 else 'transitioning'
-    return {'C': round(C, 4), 'regime': regime, 'trajectory': traj, 'n': len(s)}
+    
+    values = s.values
+    times = np.arange(len(values))
+    
+    # Trend: Spearman rho (well-defined on small samples)
+    rho = spearman_rho(times, values)
+    
+    # Direction
+    if np.isnan(rho):
+        direction = 'flat'
+    elif rho > 0.4:
+        direction = 'rising'
+    elif rho < -0.4:
+        direction = 'falling'
+    else:
+        direction = 'flat'
+    
+    first_val = float(values[0]) if values[0] != 0 else None
+    last_val = float(values[-1])
+    pct_change = round(((last_val / first_val) - 1.0) * 100, 1) if first_val and first_val != 0 else None
+    
+    return {
+        'latest':     round(last_val, 2),
+        'trend_rho':  round(float(rho), 3) if not np.isnan(rho) else None,
+        'pct_change': pct_change,
+        'avg':        round(float(np.mean(values)), 2),
+        'n':          len(values),
+        'direction':  direction,
+    }
 
 # ── Market data ────────────────────────────────────────────────────────────────
 def get_market_data(ticker: str):
@@ -159,7 +198,8 @@ def get_market_data(ticker: str):
     try:
         tk = yf.Ticker(ticker)
         info = tk.info
-        hist = tk.history(period='1y')
+        # Fetch 2y for variance score (needs 252+ trading days), tail(60) shown in chart
+        hist = tk.history(period='2y', auto_adjust=True)
         price   = info.get('currentPrice') or info.get('regularMarketPrice')
         high52  = info.get('fiftyTwoWeekHigh')
         low52   = info.get('fiftyTwoWeekLow')
@@ -175,8 +215,11 @@ def get_market_data(ticker: str):
             rsi   = round(float(val), 1) if not np.isnan(val) else None
 
         price_hist = []
+        full_price_series = None  # for variance score
         if len(hist) > 0:
             price_hist = [round(float(v), 2) for v in hist['Close'].tail(60).tolist() if not np.isnan(v)]
+            # Full series with date index for variance EWS computation
+            full_price_series = hist['Close'].copy()
 
         atm_iv = otm_iv = None
         try:
@@ -225,6 +268,7 @@ def get_market_data(ticker: str):
             'company_name':  info.get('longName') or info.get('shortName') or ticker,
             'description':   (info.get('longBusinessSummary') or '')[:300],
             'price_history': price_hist,
+            'full_price_series': full_price_series,  # for variance score; not in JSON output
             'atm_iv':        atm_iv,
             'otm_iv':        otm_iv,
             'iv_skew':       round(otm_iv-atm_iv, 1) if (atm_iv and otm_iv) else None,
@@ -319,7 +363,9 @@ def rate_metric(val, metric):
         'current_ratio':   [(1.0,'red','✗ Below 1 — stress'),(1.5,'amber','⚠ Tight'),(9,'green','✓ Healthy')],
         'interest_cov':    [(1.5,'red','✗ Stress'),(3.0,'amber','⚠ Watch'),(99,'green','✓ Healthy')],
         'debt_ebitda':     [(2.0,'green','✓ Conservative'),(4.0,'amber','~ Moderate'),(99,'red','✗ Elevated')],
-        'coupling':        [(-0.10,'green','✓ Regulated'),(0.30,'amber','⚠ Transitioning'),(2,'red','✗ Bifurcating')],
+        # variance_regime: rates the variance EWS score (annualized rolling variance)
+        # Calibrated against paper distributions: stable ~0.04-0.10, distress 0.15-0.50+
+        'variance_regime': [(0.10,'green','✓ Stable'),(0.25,'amber','⚠ Elevated'),(99,'red','✗ Distressed')],
     }
     r = rules.get(metric, [])
     if val is None:
@@ -445,7 +491,18 @@ async def analyze(ticker: str, window: int = 6):
         is_trend_up(raw.get('revenue')),
     )
 
-    # 5. ISC coupling across all series
+    # 5. Structural EWS — variance-based score (paper-validated AUC = 0.86-0.96)
+    #    Computed from daily price returns, NOT quarterly fundamentals.
+    #    Reference: Malone 2026 (Filter Collapse paper P07; IRFA submission).
+    variance_score = None
+    if mkt.get('full_price_series') is not None:
+        variance_score = compute_variance_score(
+            mkt['full_price_series'],
+            window_days=252,
+            rolling_window=90,
+        )
+
+    # Per-series fundamental trajectory (informational, not used for primary scoring)
     isc_series = {
         'Revenue':              raw.get('revenue'),
         'Gross Profit':         raw.get('gross_profit'),
@@ -457,26 +514,37 @@ async def analyze(ticker: str, window: int = 6):
         'Cash':                 raw.get('cash'),
         'Interest Expense':     raw.get('interest_expense'),
     }
-
-    isc_by_series = {}
+    series_trajectories = {}
     for name, s in isc_series.items():
-        if s is not None and len(s.dropna()) >= window+3:
-            r = compute_coupling(s, window)
-            if r:
-                isc_by_series[name] = r
+        traj = compute_series_trajectory(s)
+        if traj:
+            series_trajectories[name] = traj
 
-    # Primary ISC — prefer revenue, fall back to next available
-    primary = (isc_by_series.get('Revenue') or
-               isc_by_series.get('Operating Income') or
-               isc_by_series.get('Net Income') or
-               isc_by_series.get('Operating Cash Flow') or {})
-    primary_C      = primary.get('C')
-    primary_regime = primary.get('regime', 'insufficient_data')
-    primary_traj   = primary.get('trajectory', [])
+    # Primary structural signal — variance score if available, otherwise unavailable
+    if variance_score and 'error' not in variance_score:
+        primary_variance = variance_score.get('mean_variance')
+        primary_trend    = variance_score.get('variance_trend')
+        primary_ratio    = variance_score.get('variance_ratio')
+        primary_regime   = variance_score.get('regime')   # stable | elevated | rising | distressed
+        score_available  = True
+        score_error      = None
+    else:
+        primary_variance = None
+        primary_trend    = None
+        primary_ratio    = None
+        primary_regime   = 'unavailable'
+        score_available  = False
+        score_error      = (variance_score.get('error') if variance_score else 'no_price_data')
 
-    # 6. Options
+    # 6. Options — IV multiplier mapped to new regime labels
     atm_iv    = mkt.get('atm_iv')
-    mult_map  = {'regulated':0.92,'transitioning':1.12,'bifurcating':1.35}
+    mult_map  = {
+        'stable':      0.92,
+        'elevated':    1.05,
+        'rising':      1.18,
+        'distressed':  1.35,
+        'unavailable': 1.0,
+    }
     mult      = mult_map.get(primary_regime, 1.0)
     fair_iv   = round(atm_iv * mult, 1) if atm_iv else None
     iv_gap    = round(fair_iv - atm_iv, 1) if (fair_iv and atm_iv) else None
@@ -487,15 +555,22 @@ async def analyze(ticker: str, window: int = 6):
         return {'color': color, 'label': label}
 
     # 8. Plain-English summaries
-    def plain_isc(C, regime, ticker):
-        if C is None:
-            return 'Not enough quarterly data to compute ISC coupling.'
+    def plain_variance(score, trend, ratio, regime, ticker):
+        if regime == 'unavailable':
+            return f'Variance EWS unavailable — yfinance price data could not be retrieved for {ticker}. Traditional metrics (Altman Z, Piotroski F) below remain valid.'
+        if score is None:
+            return f'Insufficient price history to compute variance EWS for {ticker}.'
+        # Variance score in annualized units (e.g., 0.10 = ~32% annualized vol)
+        vol_pct = round((score ** 0.5) * 100, 1)  # annualized stddev as %
+        trend_label = ('rising' if (trend or 0) > 0.4 else
+                       'falling' if (trend or 0) < -0.4 else 'flat')
         texts = {
-            'regulated': f'{ticker} looks structurally healthy. When the company hits turbulence, it self-corrects rather than spiraling. Think of a healthy immune system — it fights off problems and returns to normal. ISC coupling C = {C:.3f}. No structural red flags.',
-            'transitioning': f'{ticker} is showing some structural stress. The self-correcting mechanism is weakening — small problems are not bouncing back as cleanly as they should. This appeared in Ford (2008) and Netflix (2011) before their turbulent periods. ISC coupling C = {C:.3f}. Worth watching over the next 2–4 quarters.',
-            'bifurcating': f'{ticker} is showing structurally unstable dynamics. Small problems are feeding each other instead of being absorbed — like a car that wobbles worse after every bump. This is the pattern ISC detects before major collapses. ISC coupling C = {C:.3f}. Elevated caution recommended.',
+            'stable':     f'{ticker} shows stable equity dynamics. Mean rolling variance = {score:.4f} (annualized vol ~{vol_pct}%); trend {trend_label}. Consistent with paper baseline for non-distressed firms (variance ~0.04-0.10). No structural red flags from the variance EWS.',
+            'elevated':   f'{ticker} shows elevated equity volatility. Mean rolling variance = {score:.4f} (annualized vol ~{vol_pct}%); trend {trend_label}. Above the typical stable-firm baseline. Worth comparing to sector peers and watching the trend.',
+            'rising':     f'{ticker} shows rising volatility — the trend signal that historically precedes structural transitions. Mean variance = {score:.4f} (annualized vol ~{vol_pct}%); trend rho = {trend:.2f}; latest/baseline ratio = {ratio:.2f}x. The paper-validated EWS is active; this pattern preceded events in Lehman, AIG, SVB, and others.',
+            'distressed': f'{ticker} shows high volatility AND a rising trend — the strongest variance EWS signal. Mean variance = {score:.4f} (annualized vol ~{vol_pct}%); trend rho = {trend:.2f}; latest/baseline ratio = {ratio:.2f}x. This combination of magnitude and trajectory matches the paper\'s pre-collapse reference cases.',
         }
-        return texts.get(regime, 'Insufficient data.')
+        return texts.get(regime, f'Variance EWS regime: {regime}.')
 
     def plain_z(z):
         if z is None: return 'Could not compute — missing balance sheet data.'
@@ -509,18 +584,19 @@ async def analyze(ticker: str, window: int = 6):
         if f <= 6: return f'Piotroski F = {f}/9. Mixed results. Passing some tests, failing others.'
         return f'Piotroski F = {f}/9. Passing most financial health tests. Strong signal across profitability, leverage, and efficiency.'
 
-    def divergence_summary(C, regime, altman, ticker):
-        if C is None or altman is None:
+    def divergence_summary(score, regime, altman, ticker):
+        if regime == 'unavailable' or altman is None:
             return 'Insufficient data for divergence analysis.'
-        isc_ok = regime == 'regulated'
+        # Variance EWS healthy = stable; not healthy = elevated/rising/distressed
+        ews_ok = regime == 'stable'
         alt_ok = altman >= 3.0
-        if isc_ok and alt_ok:
-            return f'Both ISC and Altman Z are consistent — structural health confirmed for {ticker}. No divergence.'
-        if not isc_ok and not alt_ok:
-            return f'Both ISC ({regime}) and Altman Z ({altman:.2f}) are flagging stress. Signals are converging — late stage deterioration. Multiple metrics now consistent.'
-        if not isc_ok and alt_ok:
-            return f'ISC LEADING — early window potentially active. ISC coupling ({C:.3f}, {regime}) is detecting structural stress while Altman Z ({altman:.2f}) still looks OK. Historical lead time: 1–5 quarters. This is the core ISC value proposition.'
-        return f'ISC is regulated but Altman Z ({altman:.2f}) is flagging. Possible accounting recovery underway or sector-specific distortion.'
+        if ews_ok and alt_ok:
+            return f'Both the variance EWS (regime: {regime}) and Altman Z ({altman:.2f}) are consistent — structural health confirmed for {ticker}. No divergence.'
+        if not ews_ok and not alt_ok:
+            return f'Both signals are flagging stress (variance regime: {regime}; Altman Z = {altman:.2f}). Signals converging — multiple metrics now consistent.'
+        if not ews_ok and alt_ok:
+            return f'Variance EWS LEADING — early window potentially active. The variance regime is {regime} (mean variance = {score:.4f}) while Altman Z ({altman:.2f}) still looks OK. Historical lead time on this divergence pattern: 1-5 quarters in retrospective testing. This is the core EWS value proposition.'
+        return f'Variance EWS shows stable but Altman Z ({altman:.2f}) is flagging. Possible accounting/balance-sheet stress not yet reflected in equity dynamics. Worth investigating further.'
 
     # ── Build response ─────────────────────────────────────────────────────────
     result = {
@@ -536,13 +612,23 @@ async def analyze(ticker: str, window: int = 6):
         },
 
         'isc': {
-            'C':        primary_C,
-            'regime':   primary_regime,
-            'trajectory': primary_traj,
-            'by_series':  {k: {'C': v['C'], 'regime': v['regime'], 'n': v['n']} for k,v in isc_by_series.items()},
-            'rating':     R(primary_C, 'coupling'),
-            'plain':      plain_isc(primary_C, primary_regime, ticker),
-            'explain':    'C = corr(Var_W, AR1_W). Measures whether volatility is self-correcting (regulated) or self-amplifying (bifurcating). Regulated: C < -0.10. Transitioning: -0.10 to 0.30. Bifurcating: C > 0.30.',
+            # === New variance-based primary signal (paper-validated) ===
+            'variance_score':    primary_variance,        # mean rolling 90d variance, annualized
+            'variance_trend':    primary_trend,           # Spearman rho of variance with time
+            'variance_ratio':    primary_ratio,           # latest / baseline
+            'regime':            primary_regime,          # stable | elevated | rising | distressed | unavailable
+            'available':         score_available,
+            'error':             score_error,
+            # === Per-series fundamental trajectory (informational only, no C) ===
+            'by_series':         series_trajectories,
+            # === Display ===
+            'rating':            R(primary_variance, 'variance_regime') if primary_variance is not None else {'color':'slate','label':'—'},
+            'plain':             plain_variance(primary_variance, primary_trend, primary_ratio, primary_regime, ticker),
+            'explain':           'Variance EWS score: mean rolling 90-day variance of daily log returns over a 252-day window, annualized. Regimes calibrated against Malone 2026 (Filter Collapse, Zenodo 18940081). Stable: <0.10. Elevated: 0.10-0.25. Distressed: >0.25. Trend (Spearman rho with time) and ratio (latest/baseline) determine rising vs static elevation. AUC = 0.86-0.96 on validation set of 45 collapse + 200 stable windows (paper IRFA submission).',
+            'methodology':       'price_based_variance_ews_v1',
+            # === Backward-compat aliases (will be removed in next major version) ===
+            'C':                 primary_variance,        # alias: legacy frontends may read 'C'
+            'trajectory':        [],                      # deprecated; was the rolling C trajectory
         },
 
         'income_statement': {
@@ -635,16 +721,18 @@ async def analyze(ticker: str, window: int = 6):
             'rating':      R(iv_gap, 'iv_gap') if iv_gap else {'color':'slate','label':'—'},
             'atm_iv_simple':  'What the options market expects the stock to move over the next year (annualized %)',
             'iv_skew_simple': 'Extra cost of downside protection — high skew means market fears a crash',
-            'fair_iv_simple': 'ISC-adjusted volatility estimate based on structural regime',
+            'fair_iv_simple': 'EWS-adjusted volatility estimate based on structural regime',
             'iv_gap_simple':  'Positive gap = options may be underpricing structural risk',
         },
 
         'divergence': {
-            'summary':    divergence_summary(primary_C, primary_regime, altman, ticker),
+            'summary':    divergence_summary(primary_variance, primary_regime, altman, ticker),
             'isc_regime': primary_regime,
             'altman_z':   altman,
-            'lead_time':  '3–5 quarters' if primary_regime=='bifurcating' else '1–3 quarters' if primary_regime=='transitioning' else 'None',
-            'simple':     'ISC detects structural deterioration before traditional metrics reflect it. The gap between ISC and Altman Z is the early window.',
+            'lead_time':  ('3-5 quarters' if primary_regime == 'distressed' else
+                           '2-4 quarters' if primary_regime == 'rising' else
+                           '1-3 quarters' if primary_regime == 'elevated' else 'None'),
+            'simple':     'The variance EWS detects equity-market evidence of structural stress; Altman Z reflects accounting balance-sheet health. When the EWS leads Altman Z, the gap is the early-warning window — empirically 1-5 quarters in retrospective testing on 45 collapse cases.',
         },
     }
 
