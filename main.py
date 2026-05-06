@@ -46,6 +46,7 @@ HEADERS = {'User-Agent': 'ISCAnalyst malonrw@gmail.com'}
 
 # ── Tag map ────────────────────────────────────────────────────────────────────
 TAG_MAP = {
+    # ── Industrial / generic (works for tech, retail, manufacturing, etc.) ──
     'revenue':            ['Revenues','RevenueFromContractWithCustomerExcludingAssessedTax','SalesRevenueNet','NetRevenues'],
     'gross_profit':       ['GrossProfit'],
     'operating_income':   ['OperatingIncomeLoss'],
@@ -59,7 +60,7 @@ TAG_MAP = {
     'cash':               ['CashAndCashEquivalentsAtCarryingValue','CashCashEquivalentsAndShortTermInvestments'],
     'receivables':        ['AccountsReceivableNetCurrent'],
     'inventory':          ['InventoryNet','Inventories'],
-    'ppe_net':            ['PropertyPlantAndEquipmentNet'],
+    'ppe_net':             ['PropertyPlantAndEquipmentNet'],
     'goodwill':           ['Goodwill'],
     'total_liabilities':  ['Liabilities'],
     'current_liabilities':['LiabilitiesCurrent'],
@@ -73,7 +74,86 @@ TAG_MAP = {
     'cfi':                ['NetCashProvidedByUsedInInvestingActivities'],
     'cff':                ['NetCashProvidedByUsedInFinancingActivities'],
     'shares_outstanding': ['CommonStockSharesOutstanding'],
+
+    # ── Bank-specific (Batch 7h.9) ──
+    'interest_income':            ['InterestAndDividendIncomeOperating','InterestIncomeOperating','InterestAndFeeIncomeLoansAndLeases'],
+    'interest_expense_bank':      ['InterestExpense','InterestExpenseBorrowings'],
+    'net_interest_income':        ['InterestIncomeExpenseNet','NetInterestIncome'],
+    'noninterest_income':         ['NoninterestIncome'],
+    'noninterest_expense':        ['NoninterestExpense'],
+    'provision_loan_losses':      ['ProvisionForLoanLeaseAndOtherLosses','ProvisionForLoanAndLeaseLosses','ProvisionForCreditLosses'],
+    'loans_receivable':           ['LoansAndLeasesReceivableNetReportedAmount','LoansAndLeasesReceivableNetOfDeferredIncome','FinancingReceivableNetCurrent'],
+    'deposits':                   ['Deposits','DepositsTotal','InterestBearingDepositsInBanks'],
+    'tier1_capital':              ['Tier1RiskBasedCapital','Tier1Capital','CommonEquityTier1Capital'],
+    'risk_weighted_assets':       ['RiskWeightedAssets','RiskBasedCapitalRequiredToBeWellCapitalized'],
+    'allowance_loan_losses':      ['LoansAndLeasesReceivableAllowance','FinancingReceivableAllowanceForCreditLosses','AllowanceForLoanAndLeaseLossesWriteOffs'],
+
+    # ── Insurance-specific (Batch 7h.9) ──
+    'premiums_earned':            ['PremiumsEarnedNet','PremiumsEarnedNetPropertyAndCasualty','InsurancePremiumsAndOtherConsiderations'],
+    'losses_incurred':            ['LiabilityForFuturePolicyBenefitsPeriodIncreaseDecrease','PolicyholderBenefitsAndClaimsIncurredNet','BenefitsLossesAndExpenses'],
+    'underwriting_expenses':      ['DeferredPolicyAcquisitionCostAmortizationExpense','OtherUnderwritingExpense'],
+    'investment_income':          ['InvestmentIncomeOperating','NetInvestmentIncome','InterestAndDividendIncomeSecuritiesOperating'],
+    'investments_held':           ['Investments','AvailableForSaleSecurities','InvestmentsAndCash'],
+    'reserves':                   ['LiabilityForFuturePolicyBenefitsAndUnpaidClaimsAndClaimsAdjustmentExpense','LiabilityForUnpaidClaimsAndClaimsAdjustmentExpense'],
+
+    # ── REIT-specific (Batch 7h.9) ──
+    'rental_income':              ['OperatingLeasesIncomeStatementLeaseRevenue','RealEstateRevenueNet','RentsAndOtherTenantReimbursements'],
+    'real_estate_revenue':        ['RealEstateRevenueNet','Revenues'],
+    'noi':                        ['OperatingIncomeLoss'],   # NOI ≈ rental_income − operating_expenses_real_estate
+    'real_estate_at_cost':        ['RealEstateInvestmentPropertyAtCost'],
+    'real_estate_accumulated_dep':['RealEstateAccumulatedDepreciation'],
+    'real_estate_net':            ['RealEstateInvestmentPropertyNet'],
+    'mortgages_payable':          ['MortgageLoansOnRealEstate','SecuredDebt','MortgagesPayableNet'],
 }
+
+
+# ── Sector detection ───────────────────────────────────────────────────────────
+# Maps SIC code prefixes (or exact codes) to one of: industrial / bank / insurance / reit / other.
+# Source: SEC SIC code list (https://www.sec.gov/info/edgar/siccodes.htm)
+def detect_sector(sic_code):
+    """Return one of: 'bank', 'insurance', 'reit', 'industrial', 'other'.
+    Industrial covers most companies (tech, retail, manufacturing, energy, etc.).
+    'other' is for explicitly financial-but-not-bank categories
+    (asset managers SIC 6282, broker-dealers 6211, holding companies 6770)
+    where industrial XBRL templates partially apply but distress metrics are unreliable.
+    """
+    if sic_code is None:
+        return 'industrial'
+    try:
+        s = int(sic_code)
+    except (TypeError, ValueError):
+        return 'industrial'
+    # REITs (most specific — check first)
+    if s == 6798:
+        return 'reit'
+    # Banks
+    if 6020 <= s <= 6099 or s in (6710, 6711, 6712):
+        return 'bank'
+    # Insurance carriers + brokers/agents
+    if 6300 <= s <= 6411:
+        return 'insurance'
+    # Other financial: asset managers (6282), broker-dealers (6211), security exchanges (6231),
+    # personal credit institutions (6141), holding companies (6770).
+    # These are tagged 'other' so the UI shows a "limited sector support" notice
+    # but core fundamentals still render.
+    if s in (6141, 6199, 6200, 6211, 6231, 6282, 6770) or 6500 <= s <= 6519:
+        return 'other'
+    # Everything else is industrial (incl. tech, retail, manufacturing, energy, healthcare, telecom)
+    return 'industrial'
+
+
+def get_company_sic(facts):
+    """Pull SIC code from company facts payload (top-level field, not under us-gaap)."""
+    if not facts:
+        return None
+    sic = facts.get('sic') or facts.get('sicCode')
+    if sic is None:
+        return None
+    try:
+        return int(sic)
+    except (TypeError, ValueError):
+        return None
+
 
 # ── EDGAR helpers ──────────────────────────────────────────────────────────────
 def get_cik(ticker: str):
@@ -106,16 +186,23 @@ FLOW_KEYS = {
     'revenue', 'gross_profit', 'operating_income', 'net_income',
     'interest_expense', 'da', 'income_tax',
     'cfo', 'capex', 'cfi', 'cff',
+    # Bank flows added in Batch 7h.9
+    'interest_income', 'interest_expense_bank', 'net_interest_income',
+    'noninterest_income', 'noninterest_expense', 'provision_loan_losses',
+    # Insurance flows
+    'premiums_earned', 'losses_incurred', 'underwriting_expenses',
+    'investment_income',
+    # REIT flows
+    'rental_income', 'real_estate_revenue',
 }
 
 def _is_quarterly_period(entry):
-    """Return True if entry looks like a quarterly (~90 day) period.
+    """True if entry looks like a quarterly (~90 day) period.
     Filters out annual (FY) and YTD (cumulative) entries that share end dates
     with quarterlies but represent different durations.
     """
     start = entry.get('start')
     end = entry.get('end')
-    fp = entry.get('fp', '')
     if not start or not end:
         return False
     try:
@@ -125,7 +212,6 @@ def _is_quarterly_period(entry):
         days = (e - s).days
     except Exception:
         return False
-    # Quarterly: roughly 80-100 days. Reject FY (~365), Q2-cumulative (~180), Q3-cumulative (~270).
     if 80 <= days <= 100:
         return True
     return False
@@ -145,14 +231,9 @@ def extract_series(facts, key, n=20):
             entries = [e for e in units[unit] if 'end' in e and 'val' in e]
             if not entries:
                 continue
-            # Batch 7h.8: for flow series (revenue, op income, etc.) restrict to
-            # quarterly-period entries to prevent mixing annual/YTD with quarterly,
-            # which previously inflated TTM sums (e.g. META op income 173% margin).
-            # For stock series (balance sheet items), keep all entries.
+            # Batch 7h.8: filter flow series to quarterly (~90d) periods only
             if is_flow:
                 qe = [e for e in entries if _is_quarterly_period(e)]
-                # Fallback: if no quarterlies found (rare — e.g. some foreign filers
-                # report only annually), fall back to original behaviour but flag in log.
                 if qe:
                     entries = qe
             seen = {}
@@ -509,6 +590,11 @@ async def analyze(ticker: str, window: int = 6):
     cik = get_cik(ticker)
     facts = get_facts(cik) if cik else None
 
+    # Batch 7h.9: detect sector from SIC code
+    sic_code = get_company_sic(facts) if facts else None
+    sic_description = facts.get('sicDescription') if facts else None
+    sector_bucket = detect_sector(sic_code)
+
     # 3. Extract series from EDGAR
     raw = {}
     if facts:
@@ -526,6 +612,42 @@ async def analyze(ticker: str, window: int = 6):
     capex_ttm = ttm(raw.get('capex'))
     cfi_ttm   = ttm(raw.get('cfi'))
     cff_ttm   = ttm(raw.get('cff'))
+
+    # Batch 7h.9: sector-specific TTM derivations
+    # Bank
+    interest_income_ttm    = ttm(raw.get('interest_income'))
+    interest_expense_b_ttm = ttm(raw.get('interest_expense_bank'))
+    net_int_income_ttm     = ttm(raw.get('net_interest_income'))
+    if not net_int_income_ttm and interest_income_ttm and interest_expense_b_ttm:
+        net_int_income_ttm = round(interest_income_ttm - interest_expense_b_ttm, 2)
+    noninterest_income_ttm  = ttm(raw.get('noninterest_income'))
+    noninterest_expense_ttm = ttm(raw.get('noninterest_expense'))
+    provision_ll_ttm        = ttm(raw.get('provision_loan_losses'))
+    loans_recv             = last(raw.get('loans_receivable'))
+    deposits_total         = last(raw.get('deposits'))
+    tier1_cap              = last(raw.get('tier1_capital'))
+    rwa                    = last(raw.get('risk_weighted_assets'))
+    allowance_ll           = last(raw.get('allowance_loan_losses'))
+
+    # Insurance
+    premiums_ttm        = ttm(raw.get('premiums_earned'))
+    losses_ttm          = ttm(raw.get('losses_incurred'))
+    underwrite_exp_ttm  = ttm(raw.get('underwriting_expenses'))
+    inv_income_ttm      = ttm(raw.get('investment_income'))
+    investments_held    = last(raw.get('investments_held'))
+    reserves_total      = last(raw.get('reserves'))
+
+    # REIT
+    rental_income_ttm   = ttm(raw.get('rental_income'))
+    real_estate_revenue_ttm = ttm(raw.get('real_estate_revenue'))
+    real_estate_at_cost = last(raw.get('real_estate_at_cost'))
+    real_estate_acc_dep = last(raw.get('real_estate_accumulated_dep'))
+    real_estate_net     = last(raw.get('real_estate_net'))
+    mortgages_payable   = last(raw.get('mortgages_payable'))
+    # FFO = Net Income + Real-Estate Depreciation - Gains on Sales (we approximate using total D&A if avail)
+    ffo_ttm = None
+    if ni_ttm is not None and da_ttm is not None:
+        ffo_ttm = round(ni_ttm + da_ttm, 2)
 
     ebitda_ttm = ttm(raw.get('operating_income'))
     if ebitda_ttm and da_ttm:
@@ -592,6 +714,132 @@ async def analyze(ticker: str, window: int = 6):
         is_trend_up(raw.get('gross_profit')),
         is_trend_up(raw.get('revenue')),
     )
+
+    # ── Batch 7h.9: Sector-specific metrics ────────────────────────────────────
+    sector_metrics = {}
+
+    if sector_bucket == 'bank':
+        # Net Interest Margin: NII / average earning assets (loans + investments).
+        # Approximation: use loans_receivable as proxy when investments series unavailable.
+        avg_earning_assets = loans_recv  # simple proxy
+        nim = safe_div(net_int_income_ttm, avg_earning_assets) if avg_earning_assets else None
+        # Efficiency ratio: noninterest expense / (NII + noninterest income). <60% = efficient.
+        efficiency_ratio = None
+        if noninterest_expense_ttm and (net_int_income_ttm or noninterest_income_ttm):
+            denom = (net_int_income_ttm or 0) + (noninterest_income_ttm or 0)
+            efficiency_ratio = safe_div(noninterest_expense_ttm, denom)
+        # Tier 1 capital ratio: Tier1 capital / Risk-Weighted Assets. >10.5% = well capitalized.
+        tier1_ratio = safe_div(tier1_cap, rwa)
+        # Loans / Deposits: liquidity proxy. <80% conservative, >100% reaching.
+        loan_deposit_ratio = safe_div(loans_recv, deposits_total)
+        # NPL coverage: allowance / loans. ~1-2% = healthy reserve. <1% = under-reserved.
+        nplc_ratio = safe_div(allowance_ll, loans_recv)
+        # Pre-Provision Net Revenue: NII + non-int income - non-int expense
+        ppnr = None
+        if net_int_income_ttm is not None or noninterest_income_ttm is not None:
+            ppnr = round(
+                (net_int_income_ttm or 0) +
+                (noninterest_income_ttm or 0) -
+                (noninterest_expense_ttm or 0), 2
+            )
+        sector_metrics = {
+            'sector': 'bank',
+            'sector_label': 'Bank',
+            'net_interest_income_ttm':  net_int_income_ttm,
+            'noninterest_income_ttm':   noninterest_income_ttm,
+            'noninterest_expense_ttm':  noninterest_expense_ttm,
+            'provision_loan_losses_ttm': provision_ll_ttm,
+            'pre_provision_net_revenue_ttm': ppnr,
+            'loans_receivable':         loans_recv,
+            'deposits_total':           deposits_total,
+            'tier1_capital':            tier1_cap,
+            'risk_weighted_assets':     rwa,
+            'allowance_loan_losses':    allowance_ll,
+            'net_interest_margin':      nim,             # NII / earning assets
+            'efficiency_ratio':         efficiency_ratio, # cost-to-income
+            'tier1_ratio':              tier1_ratio,      # capital adequacy
+            'loan_to_deposit_ratio':    loan_deposit_ratio,
+            'allowance_to_loans':       nplc_ratio,
+        }
+
+    elif sector_bucket == 'insurance':
+        # Loss Ratio: losses incurred / premiums earned. Lower = better. Industry avg ~60-70%.
+        loss_ratio = safe_div(losses_ttm, premiums_ttm)
+        # Expense Ratio: underwriting expenses / premiums earned. Industry avg ~25-30%.
+        expense_ratio = safe_div(underwrite_exp_ttm, premiums_ttm)
+        # Combined Ratio: loss_ratio + expense_ratio. <100% = profitable underwriting.
+        combined_ratio = None
+        if loss_ratio is not None and expense_ratio is not None:
+            combined_ratio = round(loss_ratio + expense_ratio, 4)
+        # Investment yield: investment income / investments held
+        inv_yield = safe_div(inv_income_ttm, investments_held)
+        # Underwriting profit
+        underwriting_profit = None
+        if premiums_ttm is not None:
+            underwriting_profit = round(
+                premiums_ttm - (losses_ttm or 0) - (underwrite_exp_ttm or 0), 2
+            )
+        sector_metrics = {
+            'sector': 'insurance',
+            'sector_label': 'Insurance',
+            'premiums_earned_ttm':  premiums_ttm,
+            'losses_incurred_ttm':  losses_ttm,
+            'underwriting_expenses_ttm': underwrite_exp_ttm,
+            'underwriting_profit_ttm':   underwriting_profit,
+            'investment_income_ttm':     inv_income_ttm,
+            'investments_held':          investments_held,
+            'reserves_total':            reserves_total,
+            'loss_ratio':                loss_ratio,
+            'expense_ratio':             expense_ratio,
+            'combined_ratio':            combined_ratio,  # <1.00 = profitable
+            'investment_yield':          inv_yield,
+        }
+
+    elif sector_bucket == 'reit':
+        # Real Estate revenue (top-line)
+        re_revenue_ttm = real_estate_revenue_ttm or rental_income_ttm or rev_ttm
+        # NOI: ~ operating income for REITs (rental income - operating expenses)
+        noi_ttm = oi_ttm
+        # FFO (Funds From Operations) — non-GAAP industry standard
+        ffo = ffo_ttm
+        # FFO per share approximation (need shares outstanding)
+        shares_out = last(raw.get('shares_outstanding'))
+        ffo_per_share = safe_div(ffo, shares_out) if (ffo and shares_out) else None
+        # Debt to gross real estate: leverage proxy
+        debt_to_re = safe_div(mortgages_payable, real_estate_at_cost)
+        # NOI yield: NOI / real estate at cost (income-on-cost)
+        noi_yield = safe_div(noi_ttm, real_estate_at_cost)
+        sector_metrics = {
+            'sector': 'reit',
+            'sector_label': 'REIT',
+            'real_estate_revenue_ttm':  re_revenue_ttm,
+            'rental_income_ttm':        rental_income_ttm,
+            'noi_ttm':                  noi_ttm,
+            'ffo_ttm':                  ffo,
+            'ffo_per_share':            ffo_per_share,
+            'real_estate_at_cost':      real_estate_at_cost,
+            'real_estate_acc_dep':      real_estate_acc_dep,
+            'real_estate_net':          real_estate_net,
+            'mortgages_payable':        mortgages_payable,
+            'debt_to_real_estate':      debt_to_re,
+            'noi_yield':                noi_yield,
+        }
+
+    elif sector_bucket == 'other':
+        # Asset managers, broker-dealers, holding companies. Industrial template
+        # partially applies but several metrics (Altman Z, gross margin) are unreliable.
+        sector_metrics = {
+            'sector': 'other',
+            'sector_label': 'Other Financial',
+            'note': 'Sector uses non-standard XBRL templates. Some industrial metrics may be unreliable; rely primarily on the variance EWS and cash flow figures.',
+        }
+
+    else:  # industrial — default; no extra metrics, but tag for UI
+        sector_metrics = {
+            'sector': 'industrial',
+            'sector_label': 'Industrial',
+        }
+
 
     # 5. Structural EWS — variance-based score (paper-validated AUC = 0.86-0.96)
     #    Computed from daily price returns, NOT quarterly fundamentals.
@@ -704,8 +952,13 @@ async def analyze(ticker: str, window: int = 6):
     result = {
         'ticker':       ticker,
         'company_name': mkt.get('company_name', ticker),
-        'sector':       mkt.get('sector'),
+        'sector':       mkt.get('sector'),       # human-readable sector from Tiingo (e.g. "Technology")
         'industry':     mkt.get('industry'),
+        # Batch 7h.9: structural sector classification from SIC code
+        'sector_bucket':    sector_bucket,        # one of: industrial, bank, insurance, reit, other
+        'sic_code':         sic_code,
+        'sic_description':  sic_description,
+        'sector_metrics':   sector_metrics,
         'description':  mkt.get('description', ''),
         'analysis_date':str(pd.Timestamp.now().date()),
         'data_sources': {
