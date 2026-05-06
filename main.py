@@ -479,6 +479,112 @@ def get_market_data(ticker: str):
     return out
 
 # ── Traditional metrics ────────────────────────────────────────────────────────
+def _build_price_only_response(ticker: str, mkt: dict, window: int):
+    """Batch 7h.14: minimal response for stocks-only analysis mode.
+
+    Skips EDGAR lookup entirely. Returns variance EWS, price history,
+    and ticker metadata. Fundamental panels (income statement, balance sheet,
+    cash flow, traditional metrics, quarterly history) are intentionally
+    omitted with a clear flag so the frontend can show appropriate fallbacks.
+    """
+    variance_score_pr = None
+    full_series = mkt.get('full_price_series')
+    if full_series is not None and len(full_series) >= 90:
+        variance_score_pr = compute_variance_score(
+            full_series,
+            window_days=252,
+            rolling_window=90,
+        )
+
+    if variance_score_pr and 'error' not in variance_score_pr:
+        primary_variance = variance_score_pr.get('mean_variance')
+        primary_trend    = variance_score_pr.get('variance_trend')
+        primary_ratio    = variance_score_pr.get('variance_ratio')
+        primary_regime   = variance_score_pr.get('regime')
+        score_available  = True
+        score_error      = None
+    else:
+        primary_variance = None
+        primary_trend    = None
+        primary_ratio    = None
+        primary_regime   = 'unavailable'
+        score_available  = False
+        score_error      = (variance_score_pr.get('error') if variance_score_pr else 'no_price_data')
+
+    # Resilient sector text from mkt
+    sector_text = mkt.get('sector') or mkt.get('industry') or ''
+
+    response = {
+        'ticker': ticker,
+        'company_name': mkt.get('company_name') or ticker,
+        'analysis_mode': 'price-only',
+        'price_only_notice': (
+            'Stocks-only analysis. EDGAR fundamentals (income statement, balance sheet, '
+            'cash flow, traditional metrics, peer comparison) are not loaded in this mode. '
+            'Switch to EDGAR mode for full fundamental analysis where filings are available.'
+        ),
+        'sector': sector_text,
+        'industry': mkt.get('industry') or '',
+        'sector_bucket': None,        # not classified without SIC
+        'sic_code': None,
+        'sic_description': None,
+        'description': mkt.get('description') or '',
+        'analysis_date': str(pd.Timestamp.now().date()),
+        'data_sources': {
+            'edgar': False,
+            'yfinance': bool(mkt.get('price')),
+            'prices': mkt.get('price_source', 'failed'),
+        },
+        'window': window,
+
+        # Market data
+        'market': {
+            'price':             mkt.get('price'),
+            'market_cap':        mkt.get('market_cap'),
+            'pe_ratio':          mkt.get('pe_ratio'),
+            'eps':               mkt.get('eps'),
+            'dividend_yield':    mkt.get('dividend_yield'),
+            'beta':              mkt.get('beta'),
+            '52w_high':          mkt.get('52w_high'),
+            '52w_low':           mkt.get('52w_low'),
+            'volume_avg_30d':    mkt.get('volume_avg_30d'),
+            'rsi_14':            mkt.get('rsi_14'),
+            'price_history':     mkt.get('price_history'),
+        },
+
+        # Variance EWS — primary signal in this mode
+        'isc': {
+            'C':                 primary_variance,
+            'regime':            primary_regime,
+            'available':         score_available,
+            'error':             score_error,
+            'variance_score':    primary_variance,
+            'variance_trend':    primary_trend,
+            'variance_ratio':    primary_ratio,
+            'plain':             None,   # frontend will compose from regime
+            'stability_score':   None,
+        },
+
+        # Explicitly empty fundamental blocks — frontend uses these flags to
+        # render "Not loaded in price-only mode" placeholders rather than
+        # silently degrading to zero values.
+        'income_statement': None,
+        'balance_sheet':    None,
+        'cash_flow':        None,
+        'traditional':      None,
+        'quarterly_history': None,
+        'sector_metrics':   None,
+
+        # Series trajectories also unavailable
+        'series_trajectories': {},
+
+        # News passthrough — empty in price-only mode for now (Tiingo news lookup
+        # is part of the full EDGAR path; price-only is intentionally minimal)
+        'news': [],
+    }
+    return response
+
+
 def _build_quarterly_history(raw, n_quarters=12):
     """Batch 7h.10: Extract quarterly time series for the frontend to render trend lines.
 
@@ -611,14 +717,37 @@ def clean_json(obj):
 
 # ── Main analysis endpoint ─────────────────────────────────────────────────────
 @app.get("/analyze/{ticker}")
-async def analyze(ticker: str, window: int = 6):
+async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
+    """
+    Analyze a ticker.
+
+    mode='edgar' (default): full EDGAR-backed analysis with variance EWS,
+        fundamentals, traditional metrics, sector context, peer comparison,
+        and quarterly history. Best for US public companies with complete
+        XBRL filings.
+
+    mode='price-only': stock-price-derived analysis only. Returns variance EWS,
+        price history, and ticker metadata. Fundamental panels (income statement,
+        balance sheet, cash flow, traditional metrics, peer comparison) are
+        intentionally omitted. Use for foreign filers, very new IPOs, or when
+        you want a faster price-only read.
+    """
     ticker = ticker.upper().strip()
+    if mode not in ("edgar", "price-only"):
+        mode = "edgar"
 
     # 1. Market data (yfinance)
     mkt = get_market_data(ticker)
     if 'error' in mkt and not mkt.get('price'):
         # yfinance failed — try EDGAR only
         pass
+
+    # Batch 7h.14: short-circuit for price-only mode.
+    # Skip EDGAR/CIK lookup, skip facts retrieval, skip all derived metrics.
+    # Return a minimal response: variance EWS + price history + sector text
+    # from yfinance only.
+    if mode == "price-only":
+        return _build_price_only_response(ticker, mkt, window)
 
     # 2. EDGAR
     cik = get_cik(ticker)
@@ -986,6 +1115,7 @@ async def analyze(ticker: str, window: int = 6):
     result = {
         'ticker':       ticker,
         'company_name': mkt.get('company_name', ticker),
+        'analysis_mode': 'edgar',  # Batch 7h.14: explicit mode flag for frontend
         'sector':       mkt.get('sector'),       # human-readable sector from Tiingo (e.g. "Technology")
         'industry':     mkt.get('industry'),
         # Batch 7h.9: structural sector classification from SIC code
