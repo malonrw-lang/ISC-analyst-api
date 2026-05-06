@@ -809,7 +809,8 @@ async def health():
 async def diagnose(ticker: str = "AAPL"):
     import traceback
     import os
-    from price_data import TIINGO_TOKEN
+    from price_data import _get_tiingo_token
+    TIINGO_TOKEN = _get_tiingo_token()
     result = {
         "ticker": ticker,
         "env_check": {
