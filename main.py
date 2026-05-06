@@ -805,8 +805,66 @@ async def analyze(ticker: str, window: int = 6):
 @app.get("/health")
 async def health():
     return {"status": "ok", "yfinance": HAS_YF}
-@app.get("/diagnose")    
-   (new diagnostic block)
+@app.get("/diagnose")
+async def diagnose(ticker: str = "AAPL"):
+    import traceback
+    from price_data import TIINGO_TOKEN
+    result = {
+        "ticker": ticker,
+        "env_check": {
+            "TIINGO_TOKEN_set": bool(TIINGO_TOKEN),
+            "TIINGO_TOKEN_length": len(TIINGO_TOKEN) if TIINGO_TOKEN else 0,
+            "TIINGO_TOKEN_first_4": TIINGO_TOKEN[:4] if TIINGO_TOKEN else "",
+            "TIINGO_TOKEN_last_4": TIINGO_TOKEN[-4:] if TIINGO_TOKEN else "",
+        },
+        "tiingo_test": {},
+        "stooq_test": {},
+        "yfinance_test": {},
+    }
+    if TIINGO_TOKEN:
+        try:
+            url = f"https://api.tiingo.com/tiingo/daily/{ticker.lower()}/prices"
+            r = requests.get(url, params={
+                "startDate": "2025-01-01",
+                "endDate":   "2025-12-31",
+                "token":     TIINGO_TOKEN,
+            }, timeout=10)
+            result["tiingo_test"] = {
+                "status_code": r.status_code,
+                "response_size": len(r.text),
+                "response_preview": r.text[:200],
+                "headers_content_type": r.headers.get("content-type", ""),
+            }
+        except Exception as e:
+            result["tiingo_test"] = {"exception": str(e), "traceback": traceback.format_exc()[-500:]}
+    else:
+        result["tiingo_test"] = {"skipped": "TIINGO_TOKEN not set"}
+    try:
+        url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
+        r = requests.get(url, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        result["stooq_test"] = {
+            "status_code": r.status_code,
+            "response_size": len(r.text),
+            "response_preview": r.text[:200],
+        }
+    except Exception as e:
+        result["stooq_test"] = {"exception": str(e), "traceback": traceback.format_exc()[-500:]}
+    if HAS_YF:
+        try:
+            tk = yf.Ticker(ticker)
+            hist = tk.history(period="5d", auto_adjust=True)
+            result["yfinance_test"] = {
+                "n_rows": len(hist),
+                "columns": list(hist.columns) if not hist.empty else [],
+                "latest_close": float(hist["Close"].iloc[-1]) if not hist.empty else None,
+            }
+        except Exception as e:
+            result["yfinance_test"] = {"exception": str(e)}
+    else:
+        result["yfinance_test"] = {"skipped": "yfinance not installed"}
+    return result
 @app.get("/")
 async def root():
     return {
