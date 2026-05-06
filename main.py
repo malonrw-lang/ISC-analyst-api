@@ -102,10 +102,39 @@ def get_facts(cik: str):
         pass
     return None
 
+FLOW_KEYS = {
+    'revenue', 'gross_profit', 'operating_income', 'net_income',
+    'interest_expense', 'da', 'income_tax',
+    'cfo', 'capex', 'cfi', 'cff',
+}
+
+def _is_quarterly_period(entry):
+    """Return True if entry looks like a quarterly (~90 day) period.
+    Filters out annual (FY) and YTD (cumulative) entries that share end dates
+    with quarterlies but represent different durations.
+    """
+    start = entry.get('start')
+    end = entry.get('end')
+    fp = entry.get('fp', '')
+    if not start or not end:
+        return False
+    try:
+        from datetime import datetime
+        s = datetime.strptime(start, '%Y-%m-%d')
+        e = datetime.strptime(end, '%Y-%m-%d')
+        days = (e - s).days
+    except Exception:
+        return False
+    # Quarterly: roughly 80-100 days. Reject FY (~365), Q2-cumulative (~180), Q3-cumulative (~270).
+    if 80 <= days <= 100:
+        return True
+    return False
+
 def extract_series(facts, key, n=20):
     if not facts or 'us-gaap' not in facts.get('facts', {}):
         return pd.Series(dtype=float)
     usgaap = facts['facts']['us-gaap']
+    is_flow = key in FLOW_KEYS
     for tag in TAG_MAP.get(key, []):
         if tag not in usgaap:
             continue
@@ -116,17 +145,27 @@ def extract_series(facts, key, n=20):
             entries = [e for e in units[unit] if 'end' in e and 'val' in e]
             if not entries:
                 continue
+            # Batch 7h.8: for flow series (revenue, op income, etc.) restrict to
+            # quarterly-period entries to prevent mixing annual/YTD with quarterly,
+            # which previously inflated TTM sums (e.g. META op income 173% margin).
+            # For stock series (balance sheet items), keep all entries.
+            if is_flow:
+                qe = [e for e in entries if _is_quarterly_period(e)]
+                # Fallback: if no quarterlies found (rare — e.g. some foreign filers
+                # report only annually), fall back to original behaviour but flag in log.
+                if qe:
+                    entries = qe
             seen = {}
             for e in entries:
                 k = e['end']
-                if k not in seen or e.get('filed','') > seen[k].get('filed',''):
+                if k not in seen or e.get('filed', '') > seen[k].get('filed', ''):
                     seen[k] = e
             sorted_e = sorted(seen.values(), key=lambda x: x['end'])[-n:]
             if len(sorted_e) < 4:
                 continue
             div = 1e6 if unit == 'USD' else 1
             s = pd.Series(
-                [e['val']/div for e in sorted_e],
+                [e['val'] / div for e in sorted_e],
                 index=pd.to_datetime([e['end'] for e in sorted_e])
             )
             return s[~s.index.duplicated(keep='last')]
