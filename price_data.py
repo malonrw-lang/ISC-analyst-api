@@ -18,7 +18,9 @@ import numpy as np
 import requests
 from typing import Optional, Tuple
 
-TIINGO_TOKEN = os.environ.get('66679b196926cca445108cf147193160ae1616e2', '')
+def _get_tiingo_token():
+    """Read token at call time, not import time (Render populates env vars late)."""
+    return os.environ.get('TIINGO_TOKEN', '')
 TIMEOUT_SEC = 12
 
 UA_BROWSER = {
