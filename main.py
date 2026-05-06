@@ -479,6 +479,40 @@ def get_market_data(ticker: str):
     return out
 
 # ── Traditional metrics ────────────────────────────────────────────────────────
+def _build_quarterly_history(raw, n_quarters=12):
+    """Batch 7h.10: Extract quarterly time series for the frontend to render trend lines.
+
+    Returns a dict keyed by metric name; each value is a list of {date, val} dicts,
+    sorted oldest-to-newest, limited to the last n_quarters entries.
+
+    Includes all flow series (revenue, operating_income, etc.) where quarterly
+    values are meaningful. Skips stock series (balance sheet items) that are
+    point-in-time and don't trend the same way.
+    """
+    METRICS = [
+        'revenue', 'gross_profit', 'operating_income', 'net_income',
+        'cfo', 'capex',
+        # Sector-specific
+        'net_interest_income', 'noninterest_income', 'noninterest_expense',
+        'premiums_earned', 'losses_incurred',
+        'rental_income',
+    ]
+    out = {}
+    for key in METRICS:
+        s = raw.get(key)
+        if s is None or len(s) == 0:
+            continue
+        s = s.dropna()
+        if len(s) == 0:
+            continue
+        tail = s.iloc[-n_quarters:]
+        out[key] = [
+            {'date': str(idx.date()), 'val': float(round(val, 2))}
+            for idx, val in zip(tail.index, tail.values)
+        ]
+    return out
+
+
 def safe_div(a, b):
     if a is None or b is None or b == 0:
         return None
@@ -1029,6 +1063,11 @@ async def analyze(ticker: str, window: int = 6):
             'fcf_margin':    {'val': round((fcf_margin or 0)*100, 1) if fcf_margin else None, 'label': 'FCF Margin %', 'simple': 'Free cash flow as % of revenue'},
             'cash_conversion':{'val': cash_conv,'label': 'Cash Conversion (CFO/NI)',     'simple': 'Is reported profit backed by actual cash? Above 1.0 is good'},
         },
+
+        # Batch 7h.10: quarterly history arrays for time-series rendering.
+        # Each entry is a list of {date, val} dicts, oldest-to-newest, up to last 12 quarters.
+        'quarterly_history': _build_quarterly_history(raw),
+
 
         'traditional': {
             'altman_z':        {'val': altman,      'label': 'Altman Z-Score',     'simple': 'Classic 5-ratio bankruptcy predictor. Above 3 safe. Below 1.81 distress.',    'rating': R(altman, 'altman_z'),      'plain': plain_z(altman)},
