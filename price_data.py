@@ -33,6 +33,7 @@ def _fetch_tiingo(ticker: str, days: int = 730) -> Optional[pd.Series]:
     Fetch daily adjusted close prices from Tiingo.
     Returns Series indexed by date, or None on failure.
     """
+    TIINGO_TOKEN = _get_tiingo_token()
     if not TIINGO_TOKEN:
         return None
     
@@ -157,7 +158,7 @@ def fetch_basic_market_metadata(ticker: str) -> dict:
         'market_cap': None, 'company_name': ticker,
         'sector': None, 'industry': None, 'description': '',
     }
-    
+    TIINGO_TOKEN = _get_tiingo_token()
     if not TIINGO_TOKEN:
         return out
     
