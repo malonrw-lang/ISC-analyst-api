@@ -48,17 +48,28 @@ def classify_regime(mean_var: float, variance_trend: float, var_ratio: float) ->
       - 'stable':   low magnitude AND not rising
       - 'rising':   trajectory clearly upward, magnitude moderate
       - 'elevated': magnitude high but not strongly rising
-      - 'distressed': magnitude high AND rising (paper's strongest signal)
+      - 'distressed': magnitude high AND rising (paper's strongest signal),
+                      OR variance very high regardless of trend (Batch 7h.10).
     """
     # Treat NaN trend as zero for classification
     if variance_trend is None or np.isnan(variance_trend):
         variance_trend = 0.0
     if var_ratio is None or np.isnan(var_ratio):
         var_ratio = 1.0
-    
+
+    # Batch 7h.10: high-magnitude override.
+    # When variance is extremely high (>= 0.5), classify as distressed regardless
+    # of trend direction. Rationale: variance >= 0.5 represents annualized vol of
+    # ~70%+ — extreme dispersion that historically only appears in genuinely
+    # distressed firms (Spirit FY22, BBBY pre-bankruptcy, late-stage Lehman).
+    # Trend can be flat or even negative if the variance has already peaked,
+    # but the absolute level is the dominant signal at that magnitude.
+    if mean_var >= 0.5:
+        return 'distressed'
+
     # Strong rising signal regardless of current magnitude
     rising_strong = variance_trend > 0.5 and var_ratio > 2.0
-    
+
     if mean_var < 0.10:
         if rising_strong:
             return 'rising'
