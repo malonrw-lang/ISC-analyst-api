@@ -805,7 +805,8 @@ async def analyze(ticker: str, window: int = 6):
 @app.get("/health")
 async def health():
     return {"status": "ok", "yfinance": HAS_YF}
-
+@app.get("/diagnose")    ← PASTE HERE
+   (new diagnostic block)
 @app.get("/")
 async def root():
     return {
