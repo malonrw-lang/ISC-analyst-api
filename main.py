@@ -807,20 +807,19 @@ async def health():
     return {"status": "ok", "yfinance": HAS_YF}
 @app.get("/diagnose")
 async def diagnose(ticker: str = "AAPL"):
-   import traceback
+    import traceback
     import os
     from price_data import TIINGO_TOKEN
     result = {
         "ticker": ticker,
         "env_check": {
-        "TIINGO_TOKEN_set": bool(TIINGO_TOKEN),
-        "TIINGO_TOKEN_length": len(TIINGO_TOKEN) if TIINGO_TOKEN else 0,
-        "TIINGO_TOKEN_first_4": TIINGO_TOKEN[:4] if TIINGO_TOKEN else "",
-        "TIINGO_TOKEN_last_4": TIINGO_TOKEN[-4:] if TIINGO_TOKEN else "",
-        "all_env_keys_with_tiingo_or_token": sorted([k for k in os.environ.keys() if 'tiingo' in k.lower() or 'token' in k.lower()]),
-        "raw_env_lookup_TIINGO_TOKEN": os.environ.get('TIINGO_TOKEN', '<not_present>'),
-        "all_env_keys_count": len(os.environ.keys()),
-    },
+            "TIINGO_TOKEN_set": bool(TIINGO_TOKEN),
+            "TIINGO_TOKEN_length": len(TIINGO_TOKEN) if TIINGO_TOKEN else 0,
+            "TIINGO_TOKEN_first_4": TIINGO_TOKEN[:4] if TIINGO_TOKEN else "",
+            "TIINGO_TOKEN_last_4": TIINGO_TOKEN[-4:] if TIINGO_TOKEN else "",
+            "all_env_keys_with_tiingo_or_token": sorted([k for k in os.environ.keys() if 'tiingo' in k.lower() or 'token' in k.lower()]),
+            "raw_env_lookup_TIINGO_TOKEN": os.environ.get('TIINGO_TOKEN', '<not_present>'),
+            "all_env_keys_count": len(os.environ.keys()),
         },
         "tiingo_test": {},
         "stooq_test": {},
