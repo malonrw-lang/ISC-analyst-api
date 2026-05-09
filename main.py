@@ -836,12 +836,19 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     # 4. Derive TTM values
     rev_ttm   = ttm(raw.get('revenue'))   or (mkt.get('total_revenue', 0) / 1e6 if mkt.get('total_revenue') else None)
     gp_ttm    = ttm(raw.get('gross_profit'))
+    # Batch 7h.16: track provenance — only the cost_of_revenue fallback path produces
+    # a gp_ttm where safe_div(gp_ttm, rev_ttm) is safe (because both numerator and
+    # denominator come from the same TTM window). When gp_ttm comes from the raw
+    # gross_profit series, period misalignment with revenue is possible and we must
+    # require aligned_ttm_ratio.
+    gp_ttm_from_fallback = False
     # Batch 7h.15: Fallback for services companies, REITs, banks that don't report
     # GrossProfit directly. Compute from revenue minus cost of revenue when available.
     if gp_ttm is None:
         cor_ttm = ttm(raw.get('cost_of_revenue'))
         if rev_ttm is not None and cor_ttm is not None:
             gp_ttm = round(rev_ttm - cor_ttm, 2)
+            gp_ttm_from_fallback = True
     oi_ttm    = ttm(raw.get('operating_income'))
     ni_ttm    = ttm(raw.get('net_income'))
     int_ttm   = ttm(raw.get('interest_expense'))
@@ -923,20 +930,47 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     wc = round(ca - cl, 2) if (ca is not None and cl is not None) else None
 
     # Margins
-    # Batch 7h.15: Use aligned_ttm_ratio to avoid period-mismatch bugs where
+    # Batch 7h.16: Use aligned_ttm_ratio to avoid period-mismatch bugs where
     # numerator and denominator come from different fiscal quarters (which can
-    # produce mathematically impossible results like op_margin > gross_margin).
-    # Falls back to safe_div(TTM, TTM) only when no quarterly series is available
-    # but TTM totals exist (e.g. computed gross_profit via cost_of_revenue
-    # fallback).
+    # produce mathematically impossible results like op_margin > gross_margin
+    # for AMZN, or net_margin > op_margin for GME).
+    #
+    # Fallback policy (changed from 7h.15):
+    #   - gross_margin: ONLY fall back to safe_div(gp_ttm, rev_ttm) when gp_ttm
+    #     came from the cost_of_revenue derivation path (which already used
+    #     period-aligned TTM totals via ttm()). If gp_ttm came from the raw
+    #     gross_profit series and aligned_ttm_ratio failed, accept None — bad
+    #     numbers are worse than missing numbers.
+    #   - op_margin / net_margin: do NOT fall back to safe_div on raw TTM. If
+    #     periods don't align, accept None. yfinance's op_margins is also
+    #     accepted as a last resort.
     gross_margin  = aligned_ttm_ratio(raw.get('gross_profit'), raw.get('revenue'))
-    if gross_margin is None and gp_ttm is not None and rev_ttm is not None:
-        # gp_ttm may have come from the revenue - cost_of_revenue fallback
+    if gross_margin is None and gp_ttm_from_fallback and gp_ttm is not None and rev_ttm is not None:
         gross_margin = safe_div(gp_ttm, rev_ttm)
     if gross_margin is None and mkt.get('gross_margins'):
         gross_margin = mkt['gross_margins']
     op_margin     = aligned_ttm_ratio(raw.get('operating_income'), raw.get('revenue')) or mkt.get('op_margins')
     net_margin    = aligned_ttm_ratio(raw.get('net_income'), raw.get('revenue'))       or mkt.get('profit_margins')
+
+    # Batch 7h.16: Server-side sanity check. If op_margin > gross_margin by more
+    # than half a percentage point of a unit (i.e. op_margin numerically larger),
+    # the two values came from misaligned data. Force both to None so the frontend
+    # gets clean N/As rather than a contradictory pair plus a warning. This catches
+    # the residual AMZN case where one value passes alignment and the other doesn't,
+    # or where yfinance's op_margins disagrees with our gross_margin.
+    if (gross_margin is not None and op_margin is not None
+            and op_margin > gross_margin + 0.005):
+        gross_margin = None
+        op_margin = None
+    # Same check for net > op (the GME pattern)
+    if (op_margin is not None and net_margin is not None
+            and net_margin > op_margin + 0.05):
+        # Less aggressive — net can occasionally exceed op slightly due to one-time
+        # tax benefits or non-operating gains, so use a 5pp threshold not 0.5pp.
+        # If exceeded, null both rather than show contradictory metrics.
+        op_margin = None
+        net_margin = None
+
     fcf_margin    = safe_div(fcf_ttm, rev_ttm)
     roa           = safe_div(ni_ttm, ta)      or mkt.get('roa')
     roe           = safe_div(ni_ttm, te)      or mkt.get('roe')
