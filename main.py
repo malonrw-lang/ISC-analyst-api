@@ -916,6 +916,14 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     std  = last(raw.get('short_term_debt'))
     tl   = last(raw.get('total_liabilities'))
     te   = last(raw.get('total_equity'))
+    # Batch 7h.16: Computational fallback when EDGAR returns total_assets and
+    # total_equity but not the standalone Liabilities tag. By the fundamental
+    # accounting identity (Assets = Liabilities + Equity), tl = ta - te is
+    # always correct when both are populated. This recovers Altman Z on tickers
+    # like AMZN where the Liabilities tag is intermittently missing from the
+    # EDGAR XBRL response while ta and te both populate.
+    if tl is None and ta is not None and te is not None:
+        tl = round(ta - te, 2)
     re   = last(raw.get('retained_earnings'))
     ap   = last(raw.get('accounts_payable'))
     ppe  = last(raw.get('ppe_net'))
