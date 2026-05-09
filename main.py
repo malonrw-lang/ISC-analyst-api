@@ -48,7 +48,9 @@ HEADERS = {'User-Agent': 'ISCAnalyst malonrw@gmail.com'}
 TAG_MAP = {
     # ── Industrial / generic (works for tech, retail, manufacturing, etc.) ──
     'revenue':            ['Revenues','RevenueFromContractWithCustomerExcludingAssessedTax','SalesRevenueNet','NetRevenues'],
-    'gross_profit':       ['GrossProfit'],
+    'gross_profit':       ['GrossProfit', 'GrossProfitLoss'],
+    'cost_of_revenue':    ['CostOfRevenue', 'CostOfGoodsAndServicesSold',
+                           'CostOfGoodsSold', 'CostOfServices'],
     'operating_income':   ['OperatingIncomeLoss'],
     'net_income':         ['NetIncomeLoss','ProfitLoss'],
     'interest_expense':   ['InterestExpense','InterestAndDebtExpense'],
@@ -70,7 +72,10 @@ TAG_MAP = {
     'total_equity':       ['StockholdersEquity','StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest'],
     'retained_earnings':  ['RetainedEarningsAccumulatedDeficit'],
     'cfo':                ['NetCashProvidedByUsedInOperatingActivities','NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
-    'capex':              ['PaymentsToAcquirePropertyPlantAndEquipment'],
+    'capex':              ['PaymentsToAcquirePropertyPlantAndEquipment',
+                           'PaymentsToAcquireProductiveAssets',
+                           'PaymentsToAcquireOtherProductiveAssets',
+                           'PaymentsForCapitalImprovements'],
     'cfi':                ['NetCashProvidedByUsedInInvestingActivities'],
     'cff':                ['NetCashProvidedByUsedInFinancingActivities'],
     'shares_outstanding': ['CommonStockSharesOutstanding'],
@@ -183,7 +188,7 @@ def get_facts(cik: str):
     return None
 
 FLOW_KEYS = {
-    'revenue', 'gross_profit', 'operating_income', 'net_income',
+    'revenue', 'gross_profit', 'cost_of_revenue', 'operating_income', 'net_income',
     'interest_expense', 'da', 'income_tax',
     'cfo', 'capex', 'cfi', 'cff',
     # Bank flows added in Batch 7h.9
@@ -270,22 +275,37 @@ def compute_series_trajectory(series, window=6):
     Analyze a quarterly fundamental series without computing the deprecated
     coupling C correlation. Returns trajectory metrics that ARE statistically
     meaningful on small quarterly samples.
-    
+
+    The `window` parameter limits analysis to the last N quarters of the series
+    (default 6 = ~18 months). A smaller window emphasizes recent trajectory; a
+    larger window captures longer-term direction. Minimum 4 quarters required
+    for a valid trend.
+
     Returns:
       {
         'latest':      most recent observed value,
         'trend_rho':   Spearman correlation with time (-1 to +1),
         'pct_change':  total percent change first to last,
         'avg':         mean across the series,
-        'n':           number of observations,
-        'direction':   'rising' | 'falling' | 'flat' (based on rho)
+        'n':           number of observations used (capped at window),
+        'direction':   'rising' | 'falling' | 'flat' (based on rho),
+        'window':      window quarters parameter used,
       }
     Returns None if insufficient data.
     """
     s = series.dropna() if series is not None else pd.Series()
     if len(s) < 4:
         return None
-    
+
+    # Batch 7h.15: actually use the window parameter — limit trajectory analysis
+    # to the last N quarters so the frontend slider has a real effect.
+    try:
+        w = int(window) if window is not None else 6
+        w = max(4, w)  # need at least 4 for a meaningful trend
+    except (TypeError, ValueError):
+        w = 6
+    s = s.iloc[-w:]
+
     values = s.values
     times = np.arange(len(values))
     
@@ -313,6 +333,7 @@ def compute_series_trajectory(series, window=6):
         'avg':        round(float(np.mean(values)), 2),
         'n':          len(values),
         'direction':  direction,
+        'window':     w,
     }
 
 # ── Market data ────────────────────────────────────────────────────────────────
@@ -537,19 +558,27 @@ def _build_price_only_response(ticker: str, mkt: dict, window: int):
         },
         'window': window,
 
-        # Market data
+        # Market data — Batch 7h.15: align field names with EDGAR-mode response
+        # so the frontend can render the same market panel in either mode.
         'market': {
-            'price':             mkt.get('price'),
-            'market_cap':        mkt.get('market_cap'),
-            'pe_ratio':          mkt.get('pe_ratio'),
-            'eps':               mkt.get('eps'),
-            'dividend_yield':    mkt.get('dividend_yield'),
-            'beta':              mkt.get('beta'),
-            '52w_high':          mkt.get('52w_high'),
-            '52w_low':           mkt.get('52w_low'),
-            'volume_avg_30d':    mkt.get('volume_avg_30d'),
-            'rsi_14':            mkt.get('rsi_14'),
-            'price_history':     mkt.get('price_history'),
+            'price':         mkt.get('price'),
+            'high_52w':      mkt.get('high_52w'),
+            'low_52w':       mkt.get('low_52w'),
+            'pct_52w':       mkt.get('pct_52w'),
+            'market_cap_bn': mkt.get('market_cap_bn'),
+            'pe':            mkt.get('pe'),
+            'pb':            mkt.get('pb'),
+            'ev_ebitda':     mkt.get('ev_ebitda'),
+            'beta':          mkt.get('beta'),
+            'rsi':           mkt.get('rsi'),
+            'dividend_yield':round((mkt.get('dividend_yield') or 0)*100, 2) if mkt.get('dividend_yield') else None,
+            'eps':           mkt.get('eps_trailing'),
+            'book_value':    mkt.get('book_value'),
+            'price_history': mkt.get('price_history', []),
+            'price_simple':  'Current stock price',
+            'pe_simple':     'Price-to-Earnings: what investors pay per $1 of profit. Lower is cheaper.',
+            'beta_simple':   'How much the stock moves vs the market. Beta 1.5 = moves 50% more than market.',
+            'rsi_simple':    'Momentum indicator 0-100. Above 70 = overbought (may pull back). Below 30 = oversold (may bounce).',
         },
 
         # Variance EWS — primary signal in this mode
@@ -642,6 +671,46 @@ def ttm(s):
         return None
     val = float(v.iloc[-4:].sum())
     return round(val, 3) if not (np.isnan(val) or np.isinf(val)) else None
+
+def aligned_ttm_ratio(numerator_series, denominator_series):
+    """Batch 7h.15: Compute a TTM ratio only when numerator and denominator
+    come from the same fiscal quarters.
+
+    The plain `ttm(num) / ttm(den)` approach can divide a TTM revenue ending Q1
+    against a TTM operating income ending Q4 of the prior year if the two
+    series have different latest-available filings. That produces nonsensical
+    ratios like operating margin > gross margin (AMZN) or net margin > operating
+    margin (GME).
+
+    This function:
+      1. Finds the last 4 quarters where BOTH series have observations on the
+         same end-date.
+      2. Sums each over those aligned quarters.
+      3. Returns the ratio, or None if alignment fails or denominator is zero.
+    """
+    if numerator_series is None or denominator_series is None:
+        return None
+    n = numerator_series.dropna() if hasattr(numerator_series, 'dropna') else None
+    d = denominator_series.dropna() if hasattr(denominator_series, 'dropna') else None
+    if n is None or d is None or len(n) == 0 or len(d) == 0:
+        return None
+    common = n.index.intersection(d.index)
+    if len(common) < 4:
+        return None
+    aligned_n = n.loc[common].iloc[-4:]
+    aligned_d = d.loc[common].iloc[-4:]
+    if len(aligned_n) < 4 or len(aligned_d) < 4:
+        return None
+    num_sum = float(aligned_n.sum())
+    den_sum = float(aligned_d.sum())
+    if den_sum == 0 or np.isnan(den_sum) or np.isinf(den_sum):
+        return None
+    if np.isnan(num_sum) or np.isinf(num_sum):
+        return None
+    v = num_sum / den_sum
+    if np.isnan(v) or np.isinf(v):
+        return None
+    return round(v, 3)
 
 def is_trend_up(s, n=4):
     if s is None or len(s.dropna()) < n+1:
@@ -767,6 +836,12 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     # 4. Derive TTM values
     rev_ttm   = ttm(raw.get('revenue'))   or (mkt.get('total_revenue', 0) / 1e6 if mkt.get('total_revenue') else None)
     gp_ttm    = ttm(raw.get('gross_profit'))
+    # Batch 7h.15: Fallback for services companies, REITs, banks that don't report
+    # GrossProfit directly. Compute from revenue minus cost of revenue when available.
+    if gp_ttm is None:
+        cor_ttm = ttm(raw.get('cost_of_revenue'))
+        if rev_ttm is not None and cor_ttm is not None:
+            gp_ttm = round(rev_ttm - cor_ttm, 2)
     oi_ttm    = ttm(raw.get('operating_income'))
     ni_ttm    = ttm(raw.get('net_income'))
     int_ttm   = ttm(raw.get('interest_expense'))
@@ -848,11 +923,20 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     wc = round(ca - cl, 2) if (ca is not None and cl is not None) else None
 
     # Margins
-    gross_margin  = safe_div(gp_ttm, rev_ttm)
+    # Batch 7h.15: Use aligned_ttm_ratio to avoid period-mismatch bugs where
+    # numerator and denominator come from different fiscal quarters (which can
+    # produce mathematically impossible results like op_margin > gross_margin).
+    # Falls back to safe_div(TTM, TTM) only when no quarterly series is available
+    # but TTM totals exist (e.g. computed gross_profit via cost_of_revenue
+    # fallback).
+    gross_margin  = aligned_ttm_ratio(raw.get('gross_profit'), raw.get('revenue'))
+    if gross_margin is None and gp_ttm is not None and rev_ttm is not None:
+        # gp_ttm may have come from the revenue - cost_of_revenue fallback
+        gross_margin = safe_div(gp_ttm, rev_ttm)
     if gross_margin is None and mkt.get('gross_margins'):
         gross_margin = mkt['gross_margins']
-    op_margin     = safe_div(oi_ttm, rev_ttm) or mkt.get('op_margins')
-    net_margin    = safe_div(ni_ttm, rev_ttm) or mkt.get('profit_margins')
+    op_margin     = aligned_ttm_ratio(raw.get('operating_income'), raw.get('revenue')) or mkt.get('op_margins')
+    net_margin    = aligned_ttm_ratio(raw.get('net_income'), raw.get('revenue'))       or mkt.get('profit_margins')
     fcf_margin    = safe_div(fcf_ttm, rev_ttm)
     roa           = safe_div(ni_ttm, ta)      or mkt.get('roa')
     roe           = safe_div(ni_ttm, te)      or mkt.get('roe')
@@ -860,9 +944,13 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     quick_ratio   = safe_div((ca or 0)-(inv or 0), cl) if (ca and cl) else mkt.get('quick_ratio')
     de_ratio      = safe_div(total_debt, te)  or mkt.get('debt_to_equity')
     debt_ebitda   = safe_div(total_debt, ebitda_ttm)
-    int_coverage  = safe_div(oi_ttm, int_ttm)
+    int_coverage  = aligned_ttm_ratio(raw.get('operating_income'), raw.get('interest_expense'))
+    if int_coverage is None:
+        int_coverage = safe_div(oi_ttm, int_ttm)
     asset_turn    = safe_div(rev_ttm, ta)
-    cash_conv     = safe_div(cfo_ttm, ni_ttm)
+    cash_conv     = aligned_ttm_ratio(raw.get('cfo'), raw.get('net_income'))
+    if cash_conv is None:
+        cash_conv = safe_div(cfo_ttm, ni_ttm)
 
     # Altman Z
     altman = compute_altman_z(ta, re, oi_ttm, rev_ttm, tl, ca, cl, mkt.get('market_cap_m'))
@@ -1029,7 +1117,7 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     }
     series_trajectories = {}
     for name, s in isc_series.items():
-        traj = compute_series_trajectory(s)
+        traj = compute_series_trajectory(s, window=window)
         if traj:
             series_trajectories[name] = traj
 
@@ -1116,6 +1204,7 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
         'ticker':       ticker,
         'company_name': mkt.get('company_name', ticker),
         'analysis_mode': 'edgar',  # Batch 7h.14: explicit mode flag for frontend
+        'window':       window,    # Batch 7h.15: quarters used for trajectory analysis
         'sector':       mkt.get('sector'),       # human-readable sector from Tiingo (e.g. "Technology")
         'industry':     mkt.get('industry'),
         # Batch 7h.9: structural sector classification from SIC code
