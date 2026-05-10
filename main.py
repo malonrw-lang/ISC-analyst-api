@@ -834,6 +834,12 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
             raw[key] = extract_series(facts, key)
 
     # 4. Derive TTM values
+    # Batch 7h.17 (Tesla fix): keep rev_ttm fallback chain conservative.
+    # Path 1: full TTM from EDGAR quarterly revenue (4+ quarters required)
+    # Path 2: yfinance totalRevenue (TTM, in dollars; convert to millions)
+    # Note: deliberately do NOT annualize from a single quarter — for seasonal
+    # businesses (retail, agricultural) this would produce wildly wrong numbers.
+    # Better to surface N/A than a fabricated annualization.
     rev_ttm   = ttm(raw.get('revenue'))   or (mkt.get('total_revenue', 0) / 1e6 if mkt.get('total_revenue') else None)
     gp_ttm    = ttm(raw.get('gross_profit'))
     # Batch 7h.16: track provenance — only the cost_of_revenue fallback path produces
@@ -1192,6 +1198,32 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     fair_iv   = round(atm_iv * mult, 1) if atm_iv else None
     iv_gap    = round(fair_iv - atm_iv, 1) if (fair_iv and atm_iv) else None
 
+    # 6b. Batch 7h.17 (Tesla fix): compute EPS and Revenue Growth fallbacks from
+    # EDGAR data when yfinance returns None. Tesla and similar tickers commonly
+    # have yfinance gaps for these fields despite the underlying data being present
+    # in 10-Q/10-K filings.
+    #
+    # EPS fallback: ni_ttm (in $M) × 1e6 / shares_outstanding
+    # Source priority: yfinance trailingEps → EDGAR-computed
+    eps_val = mkt.get('eps_trailing')
+    if eps_val is None and ni_ttm is not None:
+        shares_out = last(raw.get('shares_outstanding')) or mkt.get('shares_outstanding')
+        if shares_out and shares_out > 0:
+            eps_val = round((ni_ttm * 1e6) / shares_out, 2)
+
+    # Revenue Growth YoY fallback: (TTM revenue / TTM revenue 4 quarters ago) - 1
+    # Source priority: yfinance revenueGrowth → EDGAR-computed
+    rev_growth_val = mkt.get('revenue_growth')
+    if rev_growth_val is None:
+        rev_series = raw.get('revenue')
+        if rev_series is not None:
+            v = rev_series.dropna() if hasattr(rev_series, 'dropna') else None
+            if v is not None and len(v) >= 8:
+                ttm_now   = float(v.iloc[-4:].sum())
+                ttm_prior = float(v.iloc[-8:-4].sum())
+                if ttm_prior > 0 and not (np.isnan(ttm_now) or np.isnan(ttm_prior)):
+                    rev_growth_val = round((ttm_now - ttm_prior) / ttm_prior, 4)
+
     # 7. Ratings
     def R(val, key):
         color, label = rate_metric(val, key)
@@ -1285,16 +1317,16 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
         'income_statement': {
             'revenue':          {'val': rev_ttm,    'label': 'Revenue (TTM $M)',          'simple': 'Total sales — money coming in the front door'},
             'gross_profit':     {'val': gp_ttm,     'label': 'Gross Profit (TTM $M)',      'simple': 'Revenue minus direct cost of making the product'},
-            'gross_margin':     {'val': round((gross_margin or 0)*100, 1) if gross_margin else None, 'label': 'Gross Margin %', 'simple': 'What fraction of each sale is kept after direct costs'},
+            'gross_margin':     {'val': round(gross_margin*100, 1) if gross_margin is not None else None, 'label': 'Gross Margin %', 'simple': 'What fraction of each sale is kept after direct costs'},
             'operating_income': {'val': oi_ttm,     'label': 'Operating Income (TTM $M)',  'simple': 'Profit from running the business — before debt and taxes'},
-            'operating_margin': {'val': round((op_margin or 0)*100, 1) if op_margin else None, 'label': 'Operating Margin %', 'simple': 'Operating profit as % of sales'},
+            'operating_margin': {'val': round(op_margin*100, 1) if op_margin is not None else None, 'label': 'Operating Margin %', 'simple': 'Operating profit as % of sales'},
             'ebitda':           {'val': ebitda_ttm, 'label': 'EBITDA (TTM $M)',             'simple': 'Cash-like profit before accounting adjustments'},
             'net_income':       {'val': ni_ttm,     'label': 'Net Income (TTM $M)',         'simple': 'What the company kept after every cost — the bottom line'},
-            'net_margin':       {'val': round((net_margin or 0)*100, 1) if net_margin else None, 'label': 'Net Margin %', 'simple': 'Final profit as % of sales'},
+            'net_margin':       {'val': round(net_margin*100, 1) if net_margin is not None else None, 'label': 'Net Margin %', 'simple': 'Final profit as % of sales'},
             'interest_expense': {'val': int_ttm,    'label': 'Interest Expense (TTM $M)',   'simple': 'What the company pays on its debt each year'},
             'da':               {'val': da_ttm,     'label': 'D&A (TTM $M)',               'simple': 'Paper cost of wearing out assets — not actual cash going out'},
-            'eps':              {'val': mkt.get('eps_trailing'), 'label': 'EPS (Trailing)', 'simple': 'Profit per share — what each share earned'},
-            'revenue_growth':   {'val': round((mkt.get('revenue_growth') or 0)*100, 1) if mkt.get('revenue_growth') else None, 'label': 'Revenue Growth YoY %', 'simple': 'How fast is the top line growing?'},
+            'eps':              {'val': eps_val, 'label': 'EPS (Trailing)', 'simple': 'Profit per share — what each share earned'},
+            'revenue_growth':   {'val': round(rev_growth_val*100, 1) if rev_growth_val is not None else None, 'label': 'Revenue Growth YoY %', 'simple': 'How fast is the top line growing?'},
         },
 
         'balance_sheet': {
@@ -1321,7 +1353,7 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
             'fcf':           {'val': fcf_ttm,   'label': 'Free Cash Flow (TTM $M)',       'simple': 'Cash left after running the business — the gold standard'},
             'cfi':           {'val': cfi_ttm,   'label': 'Investing Cash Flow (TTM $M)', 'simple': 'Cash spent or received from buying and selling assets'},
             'cff':           {'val': cff_ttm,   'label': 'Financing Cash Flow (TTM $M)', 'simple': 'Cash from borrowing, repaying debt, issuing or buying back stock'},
-            'fcf_margin':    {'val': round((fcf_margin or 0)*100, 1) if fcf_margin else None, 'label': 'FCF Margin %', 'simple': 'Free cash flow as % of revenue'},
+            'fcf_margin':    {'val': round(fcf_margin*100, 1) if fcf_margin is not None else None, 'label': 'FCF Margin %', 'simple': 'Free cash flow as % of revenue'},
             'cash_conversion':{'val': cash_conv,'label': 'Cash Conversion (CFO/NI)',     'simple': 'Is reported profit backed by actual cash? Above 1.0 is good'},
         },
 
@@ -1357,7 +1389,7 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
             'beta':          mkt.get('beta'),
             'rsi':           mkt.get('rsi'),
             'dividend_yield':round((mkt.get('dividend_yield') or 0)*100, 2) if mkt.get('dividend_yield') else None,
-            'eps':           mkt.get('eps_trailing'),
+            'eps':           eps_val,
             'book_value':    mkt.get('book_value'),
             'price_history': mkt.get('price_history', []),
             'price_simple':  'Current stock price',
