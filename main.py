@@ -109,6 +109,16 @@ TAG_MAP = {
     'real_estate_accumulated_dep':['RealEstateAccumulatedDepreciation'],
     'real_estate_net':            ['RealEstateInvestmentPropertyNet'],
     'mortgages_payable':          ['MortgageLoansOnRealEstate','SecuredDebt','MortgagesPayableNet'],
+
+    # ── Beneish M-Score additions ──
+    # SGA: full SG&A line for SGAI ratio. Some firms report combined, some split.
+    'sga':                        ['SellingGeneralAndAdministrativeExpense',
+                                   'GeneralAndAdministrativeExpense',
+                                   'SellingAndMarketingExpense'],
+    # Gross PPE: needed for AQI (other non-current assets calc) and DEPI rate
+    'gross_ppe':                  ['PropertyPlantAndEquipmentGross'],
+    # Accumulated depreciation: used for DEPI = (Dep_t-1 / (Dep_t-1 + GrossPPE_t-1)) / (Dep_t / (Dep_t + GrossPPE_t))
+    'accumulated_depreciation':   ['AccumulatedDepreciationDepletionAndAmortizationPropertyPlantAndEquipment'],
 }
 
 
@@ -221,6 +231,27 @@ def _is_quarterly_period(entry):
         return True
     return False
 
+def _is_annual_period(entry):
+    """True if entry looks like an annual (~365 day) period.
+    Used for Beneish M-Score and other forensic metrics that are canonically
+    computed on FY data, not TTM. Filters out quarterly (~90d), half-year
+    (~180d), and 3Q YTD (~270d) entries.
+    """
+    start = entry.get('start')
+    end = entry.get('end')
+    if not start or not end:
+        return False
+    try:
+        from datetime import datetime
+        s = datetime.strptime(start, '%Y-%m-%d')
+        e = datetime.strptime(end, '%Y-%m-%d')
+        days = (e - s).days
+    except Exception:
+        return False
+    if 350 <= days <= 380:
+        return True
+    return False
+
 def extract_series(facts, key, n=20):
     if not facts or 'us-gaap' not in facts.get('facts', {}):
         return pd.Series(dtype=float)
@@ -256,6 +287,61 @@ def extract_series(facts, key, n=20):
             )
             return s[~s.index.duplicated(keep='last')]
     return pd.Series(dtype=float)
+
+def extract_series_annual(facts, key, n=10):
+    """Extract annual (FY) values for a given key. Used by Beneish M-Score
+    and other forensic metrics that are canonically computed on FY data.
+    Returns up to `n` most recent annual observations.
+
+    For flow keys (revenue, NI, SGA, etc.): filters to ~365d periods.
+    For stock keys (assets, receivables, etc.): takes the year-end value
+    closest to fiscal year-end. Most issuers report stock balances at
+    multiple period ends; we use end-of-fiscal-year matching by selecting
+    the value reported with each annual flow.
+    """
+    if not facts or 'us-gaap' not in facts.get('facts', {}):
+        return pd.Series(dtype=float)
+    usgaap = facts['facts']['us-gaap']
+    is_flow = key in FLOW_KEYS
+    for tag in TAG_MAP.get(key, []):
+        if tag not in usgaap:
+            continue
+        units = usgaap[tag].get('units', {})
+        for unit in ['USD', 'shares', 'USD/shares']:
+            if unit not in units:
+                continue
+            entries = [e for e in units[unit] if 'end' in e and 'val' in e]
+            if not entries:
+                continue
+            if is_flow:
+                # For flows, filter to ~365d periods (annual)
+                ae = [e for e in entries if _is_annual_period(e)]
+                if not ae:
+                    continue
+                entries = ae
+            else:
+                # For stocks (balance sheet), take period-end values with
+                # 'fp' == 'FY' if available. Fall back to end dates that
+                # appear to be fiscal year-ends (Dec 31, Sep 30 etc.).
+                fy_entries = [e for e in entries if e.get('fp') == 'FY']
+                if fy_entries:
+                    entries = fy_entries
+            seen = {}
+            for e in entries:
+                k = e['end']
+                if k not in seen or e.get('filed', '') > seen[k].get('filed', ''):
+                    seen[k] = e
+            sorted_e = sorted(seen.values(), key=lambda x: x['end'])[-n:]
+            if len(sorted_e) < 2:
+                continue
+            div = 1e6 if unit == 'USD' else 1
+            s = pd.Series(
+                [e['val'] / div for e in sorted_e],
+                index=pd.to_datetime([e['end'] for e in sorted_e])
+            )
+            return s[~s.index.duplicated(keep='last')]
+    return pd.Series(dtype=float)
+
 
 # ── Per-series trajectory (replaces deprecated compute_coupling) ──────────────
 # 
@@ -747,6 +833,215 @@ def compute_piotroski(roa, cfo, ni, roa_up, leverage_down, liquidity_up, shares_
     }
     return sum(signals.values()), signals
 
+# ── Beneish M-Score (forensic accounting fraud probability) ───────────────────
+# Reference: Beneish, M. D. (1999). "The Detection of Earnings Manipulation."
+#   Financial Analysts Journal 55(5), 24-36.
+# Original sample: 74 manipulators vs 2,332 non-manipulators, 1982-1992.
+# Reported test accuracy: ~76% true positives, ~17.5% false positives at M > -1.78.
+#
+# Eight ratios capturing year-over-year changes that are characteristic of
+# earnings manipulation:
+#
+#   DSRI = (Receivables_t / Revenue_t) / (Receivables_t-1 / Revenue_t-1)
+#     Days sales in receivables. Aggressive revenue recognition pushes this up.
+#
+#   GMI  = Gross_Margin_t-1 / Gross_Margin_t
+#     Gross margin index. >1 means margin deteriorated (motive to manipulate).
+#
+#   AQI  = (1 - (CA_t + PPE_t) / TA_t) / (1 - (CA_t-1 + PPE_t-1) / TA_t-1)
+#     Asset quality index. Rising "other assets" share → soft assets, capitalized expenses.
+#
+#   SGI  = Revenue_t / Revenue_t-1
+#     Sales growth index. High growth firms have stronger manipulation incentives.
+#
+#   DEPI = (Dep_t-1 / (Dep_t-1 + GrossPPE_t-1)) / (Dep_t / (Dep_t + GrossPPE_t))
+#     Depreciation index. >1 means depreciation rate slowed (income inflation).
+#
+#   SGAI = (SGA_t / Rev_t) / (SGA_t-1 / Rev_t-1)
+#     SG&A index. Disproportionate SG&A growth signals operating efficiency decline.
+#
+#   TATA = (NI_t - CFO_t) / TA_t
+#     Total accruals / total assets. Higher accruals → more discretionary accounting.
+#
+#   LVGI = ((LTD_t + CL_t) / TA_t) / ((LTD_t-1 + CL_t-1) / TA_t-1)
+#     Leverage index. Rising leverage may motivate covenant manipulation.
+#
+# M = -4.84 + 0.92·DSRI + 0.528·GMI + 0.404·AQI + 0.892·SGI
+#     + 0.115·DEPI - 0.172·SGAI + 4.679·TATA - 0.327·LVGI
+#
+# Thresholds:
+#   M > -1.78 (original 1999): elevated probability of manipulation. ~76% sensitivity.
+#   M > -2.22 (more recent calibration, e.g. Beneish/Lee/Nichols 2013): stricter,
+#            higher specificity, reduced false positives.
+#
+# This is a SCREENING tool, not a verdict. A high M-Score is a flag for closer
+# investigation. Banks, insurers, and utilities don't fit the model (different
+# accounting structure) — caller should suppress for those sectors.
+
+def _safe_ratio(num, den):
+    """Return num/den or None if either is None or den is zero/near-zero."""
+    if num is None or den is None:
+        return None
+    try:
+        if abs(den) < 1e-9:
+            return None
+        return num / den
+    except (TypeError, ZeroDivisionError):
+        return None
+
+def compute_beneish_m_score(rev_t, rev_p, recv_t, recv_p, gp_t, gp_p,
+                             ca_t, ca_p, ppe_t, ppe_p, ta_t, ta_p,
+                             dep_t, dep_p, gross_ppe_t, gross_ppe_p,
+                             sga_t, sga_p, ni_t, cfo_t,
+                             ltd_t, ltd_p, cl_t, cl_p):
+    """Compute Beneish M-Score and its 8 components.
+
+    All inputs are scalar values for two consecutive periods (t = current,
+    p = prior). Returns a dict with each ratio, the M-Score, threshold flags,
+    and a list of "missing inputs" that prevented full computation.
+
+    Returns None if essential inputs are missing for the core ratios.
+    """
+    missing = []
+
+    # DSRI: Days sales in receivables index
+    if all(v is not None for v in [recv_t, rev_t, recv_p, rev_p]) and rev_t and rev_p:
+        dsri_num = _safe_ratio(recv_t, rev_t)
+        dsri_den = _safe_ratio(recv_p, rev_p)
+        dsri = _safe_ratio(dsri_num, dsri_den)
+    else:
+        dsri = None
+        missing.append('DSRI (receivables/revenue)')
+
+    # GMI: Gross margin index (prior / current; >1 = deterioration)
+    if all(v is not None for v in [gp_t, gp_p, rev_t, rev_p]) and rev_t and rev_p:
+        gm_t = _safe_ratio(gp_t, rev_t)
+        gm_p = _safe_ratio(gp_p, rev_p)
+        gmi = _safe_ratio(gm_p, gm_t)
+    else:
+        gmi = None
+        missing.append('GMI (gross margin)')
+
+    # AQI: Asset quality index — share of "other" non-current assets
+    # (1 - (CA + PPE)/TA) is the "other assets" fraction.
+    if all(v is not None for v in [ca_t, ppe_t, ta_t, ca_p, ppe_p, ta_p]) and ta_t and ta_p:
+        oa_t = 1 - _safe_ratio(ca_t + ppe_t, ta_t)
+        oa_p = 1 - _safe_ratio(ca_p + ppe_p, ta_p)
+        # Avoid division by tiny/zero "other assets" denominators (mature firms)
+        if oa_p is not None and abs(oa_p) > 0.001:
+            aqi = _safe_ratio(oa_t, oa_p)
+        else:
+            aqi = 1.0  # neutral when prior other-assets is negligible
+    else:
+        aqi = None
+        missing.append('AQI (asset quality)')
+
+    # SGI: Sales growth index
+    if rev_t is not None and rev_p is not None and rev_p:
+        sgi = _safe_ratio(rev_t, rev_p)
+    else:
+        sgi = None
+        missing.append('SGI (sales growth)')
+
+    # DEPI: Depreciation rate index
+    # rate_t = dep_t / (dep_t + gross_ppe_t)
+    # rate_p = dep_p / (dep_p + gross_ppe_p)
+    # DEPI = rate_p / rate_t  (>1 means rate slowed)
+    if all(v is not None for v in [dep_t, dep_p, gross_ppe_t, gross_ppe_p]):
+        rate_t = _safe_ratio(dep_t, dep_t + gross_ppe_t)
+        rate_p = _safe_ratio(dep_p, dep_p + gross_ppe_p)
+        depi = _safe_ratio(rate_p, rate_t)
+    else:
+        depi = None
+        missing.append('DEPI (depreciation rate)')
+
+    # SGAI: SG&A index (higher = inefficiency growing)
+    if all(v is not None for v in [sga_t, sga_p, rev_t, rev_p]) and rev_t and rev_p:
+        sgai_num = _safe_ratio(sga_t, rev_t)
+        sgai_den = _safe_ratio(sga_p, rev_p)
+        sgai = _safe_ratio(sgai_num, sgai_den)
+    else:
+        sgai = None
+        missing.append('SGAI (SG&A)')
+
+    # TATA: Total accruals / total assets (current period only)
+    if all(v is not None for v in [ni_t, cfo_t, ta_t]) and ta_t:
+        tata = _safe_ratio(ni_t - cfo_t, ta_t)
+    else:
+        tata = None
+        missing.append('TATA (accruals)')
+
+    # LVGI: Leverage index
+    if all(v is not None for v in [ltd_t, cl_t, ta_t, ltd_p, cl_p, ta_p]) and ta_t and ta_p:
+        lev_t = _safe_ratio(ltd_t + cl_t, ta_t)
+        lev_p = _safe_ratio(ltd_p + cl_p, ta_p)
+        lvgi = _safe_ratio(lev_t, lev_p)
+    else:
+        lvgi = None
+        missing.append('LVGI (leverage)')
+
+    # Compute M-Score: require at least 5 of 8 ratios to attempt
+    available = [x for x in [dsri, gmi, aqi, sgi, depi, sgai, tata, lvgi] if x is not None]
+    if len(available) < 5:
+        return {
+            'm_score': None,
+            'components': {
+                'DSRI': dsri, 'GMI': gmi, 'AQI': aqi, 'SGI': sgi,
+                'DEPI': depi, 'SGAI': sgai, 'TATA': tata, 'LVGI': lvgi,
+            },
+            'missing': missing,
+            'n_ratios': len(available),
+            'flag_original': None,
+            'flag_strict': None,
+            'note': f'Insufficient data: only {len(available)} of 8 ratios computable',
+        }
+
+    # Beneish 1999 coefficients
+    # When a ratio is missing, substitute with the "neutral" value (1.0 for
+    # ratios, 0 for TATA) and flag in the response. This is a conservative
+    # approach — it neither inflates nor deflates the score for missing data.
+    m = (-4.84
+         + 0.92  * (dsri if dsri is not None else 1.0)
+         + 0.528 * (gmi  if gmi  is not None else 1.0)
+         + 0.404 * (aqi  if aqi  is not None else 1.0)
+         + 0.892 * (sgi  if sgi  is not None else 1.0)
+         + 0.115 * (depi if depi is not None else 1.0)
+         - 0.172 * (sgai if sgai is not None else 1.0)
+         + 4.679 * (tata if tata is not None else 0.0)
+         - 0.327 * (lvgi if lvgi is not None else 1.0))
+
+    # Identify top contributors by absolute contribution to score
+    contributions = {}
+    if dsri is not None: contributions['DSRI'] = 0.92 * dsri
+    if gmi  is not None: contributions['GMI']  = 0.528 * gmi
+    if aqi  is not None: contributions['AQI']  = 0.404 * aqi
+    if sgi  is not None: contributions['SGI']  = 0.892 * sgi
+    if depi is not None: contributions['DEPI'] = 0.115 * depi
+    if sgai is not None: contributions['SGAI'] = -0.172 * sgai
+    if tata is not None: contributions['TATA'] = 4.679 * tata
+    if lvgi is not None: contributions['LVGI'] = -0.327 * lvgi
+
+    return {
+        'm_score': round(m, 3),
+        'components': {
+            'DSRI': round(dsri, 3) if dsri is not None else None,
+            'GMI':  round(gmi, 3)  if gmi  is not None else None,
+            'AQI':  round(aqi, 3)  if aqi  is not None else None,
+            'SGI':  round(sgi, 3)  if sgi  is not None else None,
+            'DEPI': round(depi, 3) if depi is not None else None,
+            'SGAI': round(sgai, 3) if sgai is not None else None,
+            'TATA': round(tata, 4) if tata is not None else None,
+            'LVGI': round(lvgi, 3) if lvgi is not None else None,
+        },
+        'contributions': {k: round(v, 3) for k, v in contributions.items()},
+        'missing': missing,
+        'n_ratios': len(available),
+        'flag_original':  m > -1.78,   # 1999 threshold (more sensitive)
+        'flag_strict':    m > -2.22,   # later calibration (stricter, fewer false positives)
+        'note': None if not missing else f'Computed with {len(available)} of 8 ratios; missing: {", ".join(missing)}',
+    }
+
+
 def rate_metric(val, metric):
     """Return signal color and label for a metric value."""
     rules = {
@@ -832,6 +1127,19 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     if facts:
         for key in TAG_MAP:
             raw[key] = extract_series(facts, key)
+
+    # 3b. Extract annual (FY) series for Beneish M-Score and other forensic metrics
+    # Only for keys actually used; saves fetcher iterations.
+    BENEISH_KEYS = [
+        'revenue', 'gross_profit', 'cost_of_revenue', 'net_income',
+        'cfo', 'sga', 'da', 'gross_ppe', 'accumulated_depreciation',
+        'total_assets', 'current_assets', 'ppe_net',
+        'long_term_debt', 'current_liabilities', 'receivables',
+    ]
+    raw_annual = {}
+    if facts:
+        for key in BENEISH_KEYS:
+            raw_annual[key] = extract_series_annual(facts, key)
 
     # 4. Derive TTM values
     # Batch 7h.17 (Tesla fix): keep rev_ttm fallback chain conservative.
@@ -1013,6 +1321,63 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
         is_trend_up(raw.get('gross_profit')),
         is_trend_up(raw.get('revenue')),
     )
+
+    # ── Beneish M-Score (forensic earnings manipulation screen) ────────────────
+    # Computed on annual (FY) data per Beneish 1999 canonical formulation.
+    # Suppressed for banks/insurance/REITs (different accounting structure).
+    def _beneish_pair(key):
+        """Return (value_t, value_p) from annual series, or (None, None)."""
+        s = raw_annual.get(key)
+        if s is None or len(s) < 2:
+            return (None, None)
+        return (float(s.iloc[-1]), float(s.iloc[-2]))
+
+    beneish = None
+    if sector_bucket == 'industrial' and raw_annual:
+        # Pull pairs from annual series
+        rev_t, rev_p = _beneish_pair('revenue')
+        recv_t, recv_p = _beneish_pair('receivables')
+        gp_t, gp_p = _beneish_pair('gross_profit')
+        # Fallback: derive gross profit from revenue - cost_of_revenue if not direct
+        if gp_t is None or gp_p is None:
+            cor_t, cor_p = _beneish_pair('cost_of_revenue')
+            if rev_t is not None and cor_t is not None:
+                gp_t = rev_t - cor_t
+            if rev_p is not None and cor_p is not None:
+                gp_p = rev_p - cor_p
+        ca_t, ca_p = _beneish_pair('current_assets')
+        ppe_t, ppe_p = _beneish_pair('ppe_net')
+        ta_t, ta_p = _beneish_pair('total_assets')
+        dep_t, dep_p = _beneish_pair('da')  # depreciation+amortization expense
+        gross_ppe_t, gross_ppe_p = _beneish_pair('gross_ppe')
+        # Fallback: derive gross PPE from net PPE + accumulated depreciation
+        if gross_ppe_t is None or gross_ppe_p is None:
+            ad_t, ad_p = _beneish_pair('accumulated_depreciation')
+            if ppe_t is not None and ad_t is not None:
+                gross_ppe_t = ppe_t + ad_t
+            if ppe_p is not None and ad_p is not None:
+                gross_ppe_p = ppe_p + ad_p
+        sga_t, sga_p = _beneish_pair('sga')
+        ni_t, _ = _beneish_pair('net_income')
+        cfo_t, _ = _beneish_pair('cfo')
+        ltd_t, ltd_p = _beneish_pair('long_term_debt')
+        cl_t, cl_p = _beneish_pair('current_liabilities')
+
+        beneish_annual = compute_beneish_m_score(
+            rev_t, rev_p, recv_t, recv_p, gp_t, gp_p,
+            ca_t, ca_p, ppe_t, ppe_p, ta_t, ta_p,
+            dep_t, dep_p, gross_ppe_t, gross_ppe_p,
+            sga_t, sga_p, ni_t, cfo_t,
+            ltd_t, ltd_p, cl_t, cl_p,
+        )
+        beneish = {'annual': beneish_annual, 'sector_eligible': True}
+    else:
+        # Banks, insurance, REITs: model not applicable
+        beneish = {
+            'annual': None,
+            'sector_eligible': False,
+            'note': f'Beneish M-Score not applicable to {sector_bucket} sector (different accounting structure)',
+        }
 
     # ── Batch 7h.9: Sector-specific metrics ────────────────────────────────────
     sector_metrics = {}
@@ -1422,6 +1787,8 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
                            '1-3 quarters' if primary_regime == 'elevated' else 'None'),
             'simple':     'The variance EWS detects equity-market evidence of structural stress; Altman Z reflects accounting balance-sheet health. When the EWS leads Altman Z, the gap is the early-warning window — empirically 1-5 quarters in retrospective testing on 45 collapse cases.',
         },
+
+        'beneish': beneish,
     }
 
     return JSONResponse(content=clean_json(result))
