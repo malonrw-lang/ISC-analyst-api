@@ -66,6 +66,9 @@ TAG_MAP = {
                            'AccountsAndNotesReceivableNet',
                            'NontradeReceivablesCurrent',
                            'AccountsReceivableTradeNetCurrent'],
+    'accounts_payable':   ['AccountsPayableCurrent',
+                           'AccountsPayableAndAccruedLiabilitiesCurrent',
+                           'AccountsPayable'],
     'inventory':          ['InventoryNet','Inventories'],
     'ppe_net':             ['PropertyPlantAndEquipmentNet'],
     'goodwill':           ['Goodwill'],
@@ -1231,6 +1234,7 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     cash = last(raw.get('cash'))
     rec  = last(raw.get('receivables'))
     inv  = last(raw.get('inventory'))
+    ap   = last(raw.get('accounts_payable'))
     ltd  = last(raw.get('long_term_debt'))
     std  = last(raw.get('short_term_debt'))
     tl   = last(raw.get('total_liabilities'))
@@ -1312,6 +1316,83 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     cash_conv     = aligned_ttm_ratio(raw.get('cfo'), raw.get('net_income'))
     if cash_conv is None:
         cash_conv = safe_div(cfo_ttm, ni_ttm)
+
+    # ── Phase 2a: FP&A depth metrics ─────────────────────────────────────────
+    # These are computed from existing inputs; no new TAG_MAP fields needed.
+    # Each metric is paired with the same safety patterns as existing ratios:
+    # None when inputs missing, conservative on edge cases.
+
+    # EBITDA Margin = EBITDA / Revenue
+    # Different from FCF margin — captures operating profitability before D&A.
+    ebitda_margin = safe_div(ebitda_ttm, rev_ttm)
+
+    # FCF Yield = FCF / Market Cap
+    # Inverse of P/FCF. Higher = more cash returned per dollar invested.
+    # Different from FCF Margin (FCF/Revenue). Both are useful.
+    fcf_yield = safe_div(fcf_ttm, mkt.get('market_cap_m'))
+
+    # ROIC = NOPAT / Invested Capital
+    # NOPAT approximation: Operating Income * (1 - effective tax rate)
+    # We don't have effective tax rate computed; use a 21% federal default
+    # (US corporate rate post-TCJA). For firms with very different actual
+    # rates this approximates; a more accurate version would derive tax_rate
+    # from income statement. Flagged in note for transparency.
+    # Invested Capital = Total Debt + Total Equity (simplified — excludes
+    # operating leases and other adjustments analysts sometimes make)
+    DEFAULT_TAX_RATE = 0.21
+    invested_capital = None
+    if total_debt is not None and te is not None:
+        invested_capital = total_debt + te
+    nopat = None
+    if oi_ttm is not None:
+        nopat = round(oi_ttm * (1 - DEFAULT_TAX_RATE), 2)
+    roic = safe_div(nopat, invested_capital)
+
+    # Working capital cycle metrics — DSO, DIO, DPO
+    # These reveal channel stuffing, inventory buildup, and supplier squeeze
+    # patterns that don't show in margin analysis alone.
+    # Use 365-day basis for canonical interpretation.
+    # cor_ttm is computed above only when gp_ttm path triggers; make it
+    # available unconditionally for DIO.
+    if 'cor_ttm' not in dir() or cor_ttm is None:
+        cor_ttm = ttm(raw.get('cost_of_revenue'))
+
+    # DSO (Days Sales Outstanding) = Receivables / Revenue * 365
+    # Rising DSO can signal aggressive revenue recognition or weakening
+    # credit quality of customers.
+    dso = None
+    if rec is not None and rev_ttm is not None and rev_ttm > 0:
+        dso = round((rec / rev_ttm) * 365, 1)
+
+    # DIO (Days Inventory Outstanding) = Inventory / COGS * 365
+    # Rising DIO can signal demand weakening or inventory buildup before
+    # a writedown.
+    dio = None
+    if inv is not None and cor_ttm is not None and cor_ttm > 0:
+        dio = round((inv / cor_ttm) * 365, 1)
+
+    # DPO (Days Payable Outstanding) = Accounts Payable / COGS * 365
+    # Rising DPO can signal cash flow stress (stretching supplier payments)
+    # or, alternatively, improved negotiating leverage. Context matters.
+    dpo = None
+    if ap is not None and cor_ttm is not None and cor_ttm > 0:
+        dpo = round((ap / cor_ttm) * 365, 1)
+
+    # Cash Conversion Cycle = DSO + DIO - DPO
+    # Negative is excellent (collect before paying — Amazon model).
+    # Positive is normal (cash tied up in operations).
+    # Trend matters more than absolute level.
+    ccc = None
+    if dso is not None and dio is not None and dpo is not None:
+        ccc = round(dso + dio - dpo, 1)
+
+    # Goodwill / Total Assets
+    # High goodwill ratio = future writedown risk. M&A-heavy firms accumulate
+    # goodwill that can be impaired if acquisitions underperform.
+    # >40% is typically considered elevated.
+    goodwill_ta = None
+    if gw is not None and ta is not None and ta > 0:
+        goodwill_ta = round(gw / ta, 4)
 
     # Altman Z
     altman = compute_altman_z(ta, re, oi_ttm, rev_ttm, tl, ca, cl, mkt.get('market_cap_m'))
@@ -1742,9 +1823,17 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
             'debt_to_equity':  {'val': de_ratio,    'label': 'Debt / Equity',      'simple': 'How much debt relative to shareholder value? Higher means more leveraged.'},
             'roa':             {'val': round((roa or 0)*100,2) if roa else None, 'label': 'ROA %', 'simple': 'How efficiently does the company use its assets to make money?'},
             'roe':             {'val': round((roe or 0)*100,2) if roe else None, 'label': 'ROE %', 'simple': 'How much profit per dollar shareholders have invested?'},
+            'roic':            {'val': round((roic or 0)*100,2) if roic is not None else None, 'label': 'ROIC %', 'simple': 'Return on invested capital. NOPAT \u00f7 (debt + equity). Less distorted by buybacks than ROE. Above 15% is excellent.'},
             'asset_turnover':  {'val': asset_turn,  'label': 'Asset Turnover',     'simple': 'How much revenue does each dollar of assets generate?'},
             'gross_margin_pct':{'val': round((gross_margin or 0)*100,1) if gross_margin else None, 'label': 'Gross Margin %', 'simple': 'Fraction of each sale kept after direct costs'},
             'op_margin_pct':   {'val': round((op_margin or 0)*100,1) if op_margin else None,   'label': 'Operating Margin %', 'simple': 'Operating profit as fraction of sales'},
+            'ebitda_margin_pct': {'val': round((ebitda_margin or 0)*100,1) if ebitda_margin is not None else None, 'label': 'EBITDA Margin %', 'simple': 'EBITDA as fraction of revenue. Captures operating profitability before depreciation and amortization.'},
+            'fcf_yield_pct':   {'val': round((fcf_yield or 0)*100,2) if fcf_yield is not None else None, 'label': 'FCF Yield %', 'simple': 'Free cash flow divided by market cap. The cash a shareholder effectively earns per dollar invested. Inverse of P/FCF.'},
+            'goodwill_ta_pct': {'val': round((goodwill_ta or 0)*100,1) if goodwill_ta is not None else None, 'label': 'Goodwill / Total Assets %', 'simple': 'Share of assets that came from acquisitions. Above 40% means future writedown risk if acquisitions underperform.'},
+            'dso':             {'val': dso, 'label': 'Days Sales Outstanding', 'simple': 'How many days of revenue sit in receivables. Rising DSO can signal aggressive revenue recognition or weakening customer credit.'},
+            'dio':             {'val': dio, 'label': 'Days Inventory Outstanding', 'simple': 'How many days of COGS sit in inventory. Rising DIO can signal demand weakening or inventory buildup before a writedown.'},
+            'dpo':             {'val': dpo, 'label': 'Days Payable Outstanding', 'simple': 'How many days to pay suppliers. Rising DPO can signal cash stress (stretching payments) or improved leverage.'},
+            'cash_conversion_cycle': {'val': ccc, 'label': 'Cash Conversion Cycle', 'simple': 'DSO + DIO \u2212 DPO. Days cash is tied up in operations. Negative is excellent (collect before paying). Watch the trend.'},
         },
 
         'market': {
