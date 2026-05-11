@@ -1629,8 +1629,7 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
             window_days=variance_window_days,
             rolling_window=90,
         )w=90,
-        )
-
+       
     # Per-series fundamental trajectory (informational, not used for primary scoring)
     isc_series = {
         'Revenue':              raw.get('revenue'),
