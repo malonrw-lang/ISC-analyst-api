@@ -363,6 +363,24 @@ def extract_series_annual(facts, key, n=10):
 # The product now uses compute_variance_score() (price-based, paper-validated,
 # AUC=0.86-0.96) for the primary structural signal. Per-series fundamentals are
 # preserved here for trajectory and level analysis only — no C correlation.
+def quarters_to_trading_days(quarters):
+    """Translate the frontend's 'Rolling quarters' slider value to trading days
+    for price-based variance computation.
+
+    Approximately 63 trading days per fiscal quarter (252/4). A floor of 180
+    trading days is enforced so rolling-90 variance still has headroom for the
+    trend regression at small slider values.
+
+    Batch 7h.16: this function lets the user-facing slider actually control
+    the ISC variance window. Previously window_days was hardcoded to 252
+    everywhere, making the slider non-functional for the headline ISC number.
+    """
+    try:
+        q = int(quarters) if quarters is not None else 12
+    except (TypeError, ValueError):
+        q = 12
+    q = max(4, min(20, q))
+    return max(180, q * 63)
 
 def compute_series_trajectory(series, window=6):
     """
@@ -459,7 +477,7 @@ def get_market_data(ticker: str):
     }
     
     # 1. Daily prices via Tiingo→Stooq fallback chain
-    full_prices, price_source = fetch_daily_prices(ticker, days=730)
+    full_prices, price_source = fetch_daily_prices(ticker, days=1825)
     out['price_source'] = price_source
     
     if full_prices is not None and len(full_prices) > 0:
@@ -602,12 +620,17 @@ def _build_price_only_response(ticker: str, mkt: dict, window: int):
     cash flow, traditional metrics, quarterly history) are intentionally
     omitted with a clear flag so the frontend can show appropriate fallbacks.
     """
+    # Batch 7h.16: thread the user-selected window through to variance
+    # computation. The frontend slider sends `window` in quarters; translate
+    # to trading days so compute_variance_score actually respects the user's
+    # selection. Previously window_days was hardcoded to 252.
+    variance_window_days = quarters_to_trading_days(window)
     variance_score_pr = None
     full_series = mkt.get('full_price_series')
     if full_series is not None and len(full_series) >= 90:
         variance_score_pr = compute_variance_score(
             full_series,
-            window_days=252,
+            window_days=variance_window_days,
             rolling_window=90,
         )
 
@@ -1089,7 +1112,7 @@ def clean_json(obj):
 
 # ── Main analysis endpoint ─────────────────────────────────────────────────────
 @app.get("/analyze/{ticker}")
-async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
+async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
     """
     Analyze a ticker.
 
@@ -1594,12 +1617,18 @@ async def analyze(ticker: str, window: int = 6, mode: str = "edgar"):
     # 5. Structural EWS — variance-based score (paper-validated AUC = 0.86-0.96)
     #    Computed from daily price returns, NOT quarterly fundamentals.
     #    Reference: Malone 2026 (Filter Collapse paper P07; IRFA submission).
+    # Batch 7h.16: window_days now derived from the user-selected quarter
+    # window via quarters_to_trading_days(), so the slider actually controls
+    # how much price history feeds the variance computation. Previously
+    # hardcoded to 252 days, which made the slider non-functional for ISC.
+    variance_window_days = quarters_to_trading_days(window)
     variance_score = None
     if mkt.get('full_price_series') is not None:
         variance_score = compute_variance_score(
             mkt['full_price_series'],
-            window_days=252,
+            window_days=variance_window_days,
             rolling_window=90,
+        )w=90,
         )
 
     # Per-series fundamental trajectory (informational, not used for primary scoring)
