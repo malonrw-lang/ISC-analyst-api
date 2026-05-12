@@ -974,10 +974,25 @@ def compute_beneish_m_score(rev_t, rev_p, recv_t, recv_p, gp_t, gp_p,
         missing.append('DSRI (receivables/revenue)')
 
     # GMI: Gross margin index (prior / current; >1 = deterioration)
+    # Batch 7h.22: guard against nonsensical sign when one gross margin is
+    # negative or both yield a non-positive ratio. The ratio is only meaningful
+    # for two same-sign positive margins. Examples of the original bug: META
+    # was returning GMI = -0.829 due to bad intermediate values (likely a stale
+    # cost_of_revenue XBRL value flowing through the fallback path).
+    gm_t = gm_p = None
     if all(v is not None for v in [gp_t, gp_p, rev_t, rev_p]) and rev_t and rev_p:
         gm_t = _safe_ratio(gp_t, rev_t)
         gm_p = _safe_ratio(gp_p, rev_p)
-        gmi = _safe_ratio(gm_p, gm_t)
+        # Both margins must be positive for the ratio to be interpretable.
+        # If either is non-positive (negative or zero), the firm has cost-side
+        # accounting structure that breaks the Beneish assumption.
+        if gm_t is not None and gm_p is not None and gm_t > 0 and gm_p > 0:
+            gmi = gm_p / gm_t
+        else:
+            gmi = None
+            missing.append('GMI (one or both gross margins non-positive: gm_t={}, gm_p={})'.format(
+                round(gm_t, 4) if gm_t is not None else None,
+                round(gm_p, 4) if gm_p is not None else None))
     else:
         gmi = None
         missing.append('GMI (gross margin)')
@@ -1054,6 +1069,12 @@ def compute_beneish_m_score(rev_t, rev_p, recv_t, recv_p, gp_t, gp_p,
             'flag_original': None,
             'flag_strict': None,
             'note': f'Insufficient data: only {len(available)} of 8 ratios computable',
+            'diagnostic': {
+                'rev_t': rev_t, 'rev_p': rev_p,
+                'gp_t': gp_t, 'gp_p': gp_p,
+                'gm_t': round(gm_t, 4) if gm_t is not None else None,
+                'gm_p': round(gm_p, 4) if gm_p is not None else None,
+            },
         }
 
     # Beneish 1999 coefficients
@@ -1099,6 +1120,15 @@ def compute_beneish_m_score(rev_t, rev_p, recv_t, recv_p, gp_t, gp_p,
         'flag_original':  m > -1.78,   # 1999 threshold (more sensitive)
         'flag_strict':    m > -2.22,   # later calibration (stricter, fewer false positives)
         'note': None if not missing else f'Computed with {len(available)} of 8 ratios; missing: {", ".join(missing)}',
+        # Batch 7h.22: intermediate values for diagnostic inspection. Helps trace
+        # cases where a ratio is None or returns an unexpected value — frontend
+        # can show these in a "data quality" expandable section for power users.
+        'diagnostic': {
+            'rev_t': rev_t, 'rev_p': rev_p,
+            'gp_t': gp_t, 'gp_p': gp_p,
+            'gm_t': round(gm_t, 4) if gm_t is not None else None,
+            'gm_p': round(gm_p, 4) if gm_p is not None else None,
+        },
     }
 
 
@@ -1229,6 +1259,7 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
     oi_ttm    = ttm(raw.get('operating_income'))
     ni_ttm    = ttm(raw.get('net_income'))
     int_ttm   = ttm(raw.get('interest_expense'))
+    tax_ttm   = ttm(raw.get('income_tax'))   # Batch 7h.22: for effective tax rate in ROIC
     da_ttm    = ttm(raw.get('da'))
     cfo_ttm   = ttm(raw.get('cfo'))       or (mkt.get('operating_cashflow', 0) / 1e6 if mkt.get('operating_cashflow') else None)
     capex_ttm = ttm(raw.get('capex'))
@@ -1388,19 +1419,33 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
 
     # ROIC = NOPAT / Invested Capital
     # NOPAT approximation: Operating Income * (1 - effective tax rate)
-    # We don't have effective tax rate computed; use a 21% federal default
-    # (US corporate rate post-TCJA). For firms with very different actual
-    # rates this approximates; a more accurate version would derive tax_rate
-    # from income statement. Flagged in note for transparency.
+    # Batch 7h.22: compute effective tax rate from actual filings rather than
+    # using a 21% federal default. Effective rate = tax_expense / pretax_income,
+    # where pretax_income ≈ net_income + income_tax (since pretax = pretax_income,
+    # and net = pretax - tax → pretax = net + tax).
+    # Fall back to 21% only when tax_ttm or ni_ttm unavailable.
+    # Sanity bounds: clamp to [0.0, 0.45] — outside this range likely indicates
+    # tax loss carryforwards, deferred tax credits, or anomalous one-time items
+    # that don't reflect ongoing operations. The 21% default is more honest in
+    # those cases than a wildly off effective rate.
     # Invested Capital = Total Debt + Total Equity (simplified — excludes
     # operating leases and other adjustments analysts sometimes make)
     DEFAULT_TAX_RATE = 0.21
+    effective_tax_rate = DEFAULT_TAX_RATE
+    effective_tax_rate_source = 'default_21pct'
+    if tax_ttm is not None and ni_ttm is not None:
+        pretax_ttm = ni_ttm + tax_ttm
+        if pretax_ttm and pretax_ttm > 0:  # positive pretax: meaningful effective rate
+            raw_rate = tax_ttm / pretax_ttm
+            if 0.0 <= raw_rate <= 0.45:
+                effective_tax_rate = raw_rate
+                effective_tax_rate_source = 'computed_from_filings'
     invested_capital = None
     if total_debt is not None and te is not None:
         invested_capital = total_debt + te
     nopat = None
     if oi_ttm is not None:
-        nopat = round(oi_ttm * (1 - DEFAULT_TAX_RATE), 2)
+        nopat = round(oi_ttm * (1 - effective_tax_rate), 2)
     roic = safe_div(nopat, invested_capital)
 
     # Working capital cycle metrics — DSO, DIO, DPO
@@ -1891,7 +1936,7 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
             'debt_to_equity':  {'val': de_ratio,    'label': 'Debt / Equity',      'simple': 'How much debt relative to shareholder value? Higher means more leveraged.'},
             'roa':             {'val': round((roa or 0)*100,2) if roa else None, 'label': 'ROA %', 'simple': 'How efficiently does the company use its assets to make money?'},
             'roe':             {'val': round((roe or 0)*100,2) if roe else None, 'label': 'ROE %', 'simple': 'How much profit per dollar shareholders have invested?'},
-            'roic':            {'val': round((roic or 0)*100,2) if roic is not None else None, 'label': 'ROIC %', 'simple': 'Return on invested capital. NOPAT \u00f7 (debt + equity). Less distorted by buybacks than ROE. Above 15% is excellent.'},
+            'roic':            {'val': round((roic or 0)*100,2) if roic is not None else None, 'label': 'ROIC %', 'simple': 'Return on invested capital. NOPAT \u00f7 (debt + equity). Less distorted by buybacks than ROE. Above 15% is excellent.', 'effective_tax_rate': round(effective_tax_rate * 100, 1), 'effective_tax_rate_source': effective_tax_rate_source},
             'asset_turnover':  {'val': asset_turn,  'label': 'Asset Turnover',     'simple': 'How much revenue does each dollar of assets generate?'},
             'gross_margin_pct':{'val': round((gross_margin or 0)*100,1) if gross_margin else None, 'label': 'Gross Margin %', 'simple': 'Fraction of each sale kept after direct costs'},
             'op_margin_pct':   {'val': round((op_margin or 0)*100,1) if op_margin else None,   'label': 'Operating Margin %', 'simple': 'Operating profit as fraction of sales'},
