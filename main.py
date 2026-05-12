@@ -165,11 +165,20 @@ def detect_sector(sic_code):
     return 'industrial'
 
 
-def get_company_sic(facts):
-    """Pull SIC code from company facts payload (top-level field, not under us-gaap)."""
-    if not facts:
+def get_company_sic(submissions):
+    """Pull SIC code from the EDGAR submissions payload.
+
+    NOTE: SIC code lives in the /submissions/CIK{cik}.json response, NOT in
+    /api/xbrl/companyfacts/. The companyfacts endpoint returns only
+    {cik, entityName, facts:{us-gaap:{...}, dei:{...}}} — no sector metadata.
+    Prior versions of this function read from `facts` and always returned
+    None, silently degrading every ticker to the industrial sector bucket
+    regardless of actual industry (banks getting industrial-template metrics,
+    REITs getting industrial Altman, etc). Fixed in Batch 7h.20.
+    """
+    if not submissions:
         return None
-    sic = facts.get('sic') or facts.get('sicCode')
+    sic = submissions.get('sic') or submissions.get('sicCode')
     if sic is None:
         return None
     try:
@@ -197,6 +206,26 @@ def get_facts(cik: str):
     try:
         r = requests.get(
             f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json',
+            headers=HEADERS, timeout=30
+        )
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+    return None
+
+
+def get_submissions(cik: str):
+    """Fetch the EDGAR submissions payload for company metadata.
+
+    The submissions endpoint contains sic, sicDescription, name, tickers,
+    sector-relevant metadata, and recent filings. Distinct from companyfacts
+    (which carries the XBRL numerical series but no sector info).
+    Added Batch 7h.20 to fix silent sector-bucket misclassification.
+    """
+    try:
+        r = requests.get(
+            f'https://data.sec.gov/submissions/CIK{cik}.json',
             headers=HEADERS, timeout=30
         )
         if r.status_code == 200:
@@ -1147,10 +1176,13 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
     # 2. EDGAR
     cik = get_cik(ticker)
     facts = get_facts(cik) if cik else None
+    submissions = get_submissions(cik) if cik else None
 
     # Batch 7h.9: detect sector from SIC code
-    sic_code = get_company_sic(facts) if facts else None
-    sic_description = facts.get('sicDescription') if facts else None
+    # Batch 7h.20: SIC lives in submissions endpoint, not companyfacts. Prior
+    # version always returned None, defaulting every ticker to industrial bucket.
+    sic_code = get_company_sic(submissions)
+    sic_description = submissions.get('sicDescription') if submissions else None
     sector_bucket = detect_sector(sic_code)
 
     # 3. Extract series from EDGAR
@@ -1753,13 +1785,21 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
         return f'Variance EWS shows stable but Altman Z ({altman:.2f}) is flagging. Possible accounting/balance-sheet stress not yet reflected in equity dynamics. Worth investigating further.'
 
     # ── Build response ─────────────────────────────────────────────────────────
+    # Batch 7h.20: sector/industry display fallback chain.
+    # Primary: yfinance info.sector/industry (when available).
+    # Fallback: EDGAR sic_description (always available for US filers).
+    # Without this fallback, the UI shows a blank sector line for any ticker
+    # where yfinance is blocked/rate-limited on Render, which is most of them.
+    display_sector = mkt.get('sector') or sic_description or ''
+    display_industry = mkt.get('industry') or sic_description or ''
+
     result = {
         'ticker':       ticker,
         'company_name': mkt.get('company_name', ticker),
         'analysis_mode': 'edgar',  # Batch 7h.14: explicit mode flag for frontend
         'window':       window,    # Batch 7h.15: quarters used for trajectory analysis
-        'sector':       mkt.get('sector'),       # human-readable sector from Tiingo (e.g. "Technology")
-        'industry':     mkt.get('industry'),
+        'sector':       display_sector,    # yfinance preferred; EDGAR sicDescription fallback
+        'industry':     display_industry,
         # Batch 7h.9: structural sector classification from SIC code
         'sector_bucket':    sector_bucket,        # one of: industrial, bank, insurance, reit, other
         'sic_code':         sic_code,
