@@ -303,6 +303,24 @@ def extract_series(facts, key, n=20):
         return pd.Series(dtype=float)
     usgaap = facts['facts']['us-gaap']
     is_flow = key in FLOW_KEYS
+    # Batch 7h.23: AAPL-class fix. Merge entries across all candidate tags
+    # rather than stopping at the first tag with >=4 entries.
+    #
+    # Original bug: companies migrate XBRL tags over time. Apple tagged revenue
+    # as 'Revenues' through FY2018, then switched to
+    # 'RevenueFromContractWithCustomerExcludingAssessedTax' after ASC 606 adoption.
+    # The first-match-wins logic returned 8 stale 2016-2018 'Revenues' entries
+    # and never checked the newer tag, so TTM summed pre-2019 quarters. Display
+    # showed AAPL revenue = $265B (real TTM is $451B). Same pattern affects any
+    # filer that changed tag conventions over the data window (cost_of_revenue
+    # vs CostOfGoodsAndServicesSold, da vs DepreciationAndAmortization, etc).
+    #
+    # Strategy: collect entries from ALL candidate tags into a single bag,
+    # then dedupe by end-date keeping the most recently filed observation.
+    # Quarterly filter applied per-tag so we don't pollute the quarterly series
+    # with annual/YTD entries from a tag that happens to also store them.
+    pooled_entries = []
+    chosen_unit = None
     for tag in TAG_MAP.get(key, []):
         if tag not in usgaap:
             continue
@@ -310,29 +328,48 @@ def extract_series(facts, key, n=20):
         for unit in ['USD', 'shares', 'USD/shares']:
             if unit not in units:
                 continue
+            # Lock unit to whatever the first tag used; mixing units across tags
+            # would be ambiguous. In practice every tag candidate for a given key
+            # uses the same unit (USD for flows, shares for share counts).
+            if chosen_unit is None:
+                chosen_unit = unit
+            if unit != chosen_unit:
+                continue
             entries = [e for e in units[unit] if 'end' in e and 'val' in e]
             if not entries:
                 continue
-            # Batch 7h.8: filter flow series to quarterly (~90d) periods only
+            # Filter to quarterly periods for flow series (income statement / cash flow).
+            # Balance-sheet keys are instant points-in-time and skip this filter.
             if is_flow:
                 qe = [e for e in entries if _is_quarterly_period(e)]
                 if qe:
                     entries = qe
-            seen = {}
+            # Tag the entries with their source so downstream debugging can see
+            # which tag contributed which observations (helpful in future audits).
             for e in entries:
-                k = e['end']
-                if k not in seen or e.get('filed', '') > seen[k].get('filed', ''):
-                    seen[k] = e
-            sorted_e = sorted(seen.values(), key=lambda x: x['end'])[-n:]
-            if len(sorted_e) < 4:
-                continue
-            div = 1e6 if unit == 'USD' else 1
-            s = pd.Series(
-                [e['val'] / div for e in sorted_e],
-                index=pd.to_datetime([e['end'] for e in sorted_e])
-            )
-            return s[~s.index.duplicated(keep='last')]
-    return pd.Series(dtype=float)
+                e_copy = dict(e)
+                e_copy['_source_tag'] = tag
+                pooled_entries.append(e_copy)
+            break  # don't double-pool across units for the same tag
+    if not pooled_entries or chosen_unit is None:
+        return pd.Series(dtype=float)
+    # Dedupe by end-date, keeping most recently filed observation. When two tags
+    # report a value for the same period, the more recently filed one is the
+    # authoritative one (typically the post-ASC 606 tag for transition-era quarters).
+    seen = {}
+    for e in pooled_entries:
+        k = e['end']
+        if k not in seen or e.get('filed', '') > seen[k].get('filed', ''):
+            seen[k] = e
+    sorted_e = sorted(seen.values(), key=lambda x: x['end'])[-n:]
+    if len(sorted_e) < 4:
+        return pd.Series(dtype=float)
+    div = 1e6 if chosen_unit == 'USD' else 1
+    s = pd.Series(
+        [e['val'] / div for e in sorted_e],
+        index=pd.to_datetime([e['end'] for e in sorted_e])
+    )
+    return s[~s.index.duplicated(keep='last')]
 
 def extract_series_annual(facts, key, n=10):
     """Extract annual (FY) values for a given key. Used by Beneish M-Score
@@ -344,17 +381,28 @@ def extract_series_annual(facts, key, n=10):
     closest to fiscal year-end. Most issuers report stock balances at
     multiple period ends; we use end-of-fiscal-year matching by selecting
     the value reported with each annual flow.
+
+    Batch 7h.23: pools entries across all candidate tags rather than
+    stopping at first one with sufficient entries. Same fix as
+    extract_series() — fixes META's stale gross_profit annual extraction
+    and any other filer that migrated XBRL tags mid-history.
     """
     if not facts or 'us-gaap' not in facts.get('facts', {}):
         return pd.Series(dtype=float)
     usgaap = facts['facts']['us-gaap']
     is_flow = key in FLOW_KEYS
+    pooled_entries = []
+    chosen_unit = None
     for tag in TAG_MAP.get(key, []):
         if tag not in usgaap:
             continue
         units = usgaap[tag].get('units', {})
         for unit in ['USD', 'shares', 'USD/shares']:
             if unit not in units:
+                continue
+            if chosen_unit is None:
+                chosen_unit = unit
+            if unit != chosen_unit:
                 continue
             entries = [e for e in units[unit] if 'end' in e and 'val' in e]
             if not entries:
@@ -372,21 +420,27 @@ def extract_series_annual(facts, key, n=10):
                 fy_entries = [e for e in entries if e.get('fp') == 'FY']
                 if fy_entries:
                     entries = fy_entries
-            seen = {}
             for e in entries:
-                k = e['end']
-                if k not in seen or e.get('filed', '') > seen[k].get('filed', ''):
-                    seen[k] = e
-            sorted_e = sorted(seen.values(), key=lambda x: x['end'])[-n:]
-            if len(sorted_e) < 2:
-                continue
-            div = 1e6 if unit == 'USD' else 1
-            s = pd.Series(
-                [e['val'] / div for e in sorted_e],
-                index=pd.to_datetime([e['end'] for e in sorted_e])
-            )
-            return s[~s.index.duplicated(keep='last')]
-    return pd.Series(dtype=float)
+                e_copy = dict(e)
+                e_copy['_source_tag'] = tag
+                pooled_entries.append(e_copy)
+            break  # don't double-pool across units for the same tag
+    if not pooled_entries or chosen_unit is None:
+        return pd.Series(dtype=float)
+    seen = {}
+    for e in pooled_entries:
+        k = e['end']
+        if k not in seen or e.get('filed', '') > seen[k].get('filed', ''):
+            seen[k] = e
+    sorted_e = sorted(seen.values(), key=lambda x: x['end'])[-n:]
+    if len(sorted_e) < 2:
+        return pd.Series(dtype=float)
+    div = 1e6 if chosen_unit == 'USD' else 1
+    s = pd.Series(
+        [e['val'] / div for e in sorted_e],
+        index=pd.to_datetime([e['end'] for e in sorted_e])
+    )
+    return s[~s.index.duplicated(keep='last')]
 
 
 # ── Per-series trajectory (replaces deprecated compute_coupling) ──────────────
