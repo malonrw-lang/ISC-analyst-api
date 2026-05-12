@@ -161,6 +161,15 @@ def detect_sector(sic_code):
     # but core fundamentals still render.
     if s in (6141, 6199, 6200, 6211, 6231, 6282, 6770) or 6500 <= s <= 6519:
         return 'other'
+    # Batch 7h.22: Biotech/pharma (2834 pharm prep, 2835 in-vitro/in-vivo diagnostics,
+    # 2836 biological products, 8731 commercial physical & biological research).
+    # Pre-revenue and clinical-stage biotechs have negative or near-zero gross margins
+    # and operating losses by design (R&D burn before product approval). Altman Z
+    # structurally flags them as distressed even when cash-rich; Beneish ratios are
+    # unreliable because they assume a steady-state revenue/cost relationship. Route
+    # through 'biotech' bucket which uses the same suppression treatment as 'other'.
+    if s in (2834, 2835, 2836, 8731):
+        return 'biotech'
     # Everything else is industrial (incl. tech, retail, manufacturing, energy, healthcare, telecom)
     return 'industrial'
 
@@ -1682,6 +1691,18 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
             'sector': 'other',
             'sector_label': 'Other Financial',
             'note': 'Sector uses non-standard XBRL templates. Some industrial metrics may be unreliable; rely primarily on the variance EWS and cash flow figures.',
+        }
+
+    elif sector_bucket == 'biotech':
+        # Pharma/biotech (SIC 2834-2836, 8731). Pre-revenue or clinical-stage firms
+        # have operating losses and negative gross margins by design — R&D burn before
+        # product approval. Altman Z structurally flags them as distressed even when
+        # cash-rich. Beneish is suppressed (handled by the industrial-only gate above).
+        # Rely on cash runway, variance EWS, and pipeline-stage context (not in scope here).
+        sector_metrics = {
+            'sector': 'biotech',
+            'sector_label': 'Pharma / Biotech',
+            'note': 'Pharma and biotech firms with operating losses and pre-revenue stages do not fit standard distress models (Altman Z, Beneish). Rely on the variance EWS, cash position, runway, and clinical-stage context.',
         }
 
     else:  # industrial — default; no extra metrics, but tag for UI
