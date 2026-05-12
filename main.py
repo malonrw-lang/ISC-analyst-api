@@ -1252,12 +1252,25 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
     # Better to surface N/A than a fabricated annualization.
     rev_ttm   = ttm(raw.get('revenue'))   or (mkt.get('total_revenue', 0) / 1e6 if mkt.get('total_revenue') else None)
     gp_ttm    = ttm(raw.get('gross_profit'))
+    oi_ttm_for_check = ttm(raw.get('operating_income'))  # needed for sanity check below
     # Batch 7h.16: track provenance — only the cost_of_revenue fallback path produces
     # a gp_ttm where safe_div(gp_ttm, rev_ttm) is safe (because both numerator and
     # denominator come from the same TTM window). When gp_ttm comes from the raw
     # gross_profit series, period misalignment with revenue is possible and we must
     # require aligned_ttm_ratio.
     gp_ttm_from_fallback = False
+    # Batch 7h.22: accounting-identity sanity check. By definition, operating income
+    # (= gross profit - operating expenses) must be <= gross profit. If gp_ttm is
+    # smaller than oi_ttm, the XBRL extraction picked up a segment-only or wrong-context
+    # value (observed for AMZN where gp_ttm came back as ~$4B vs real ~$329B, but
+    # oi_ttm came back as the correct ~$79B). Reject and trigger the cost-of-revenue
+    # fallback chain. Threshold: require gp_ttm >= 0.9 * oi_ttm to allow for small
+    # rounding/timing differences while catching the segment-misextraction case.
+    gp_ttm_sanity_failed = False
+    if gp_ttm is not None and oi_ttm_for_check is not None and oi_ttm_for_check > 0:
+        if gp_ttm < 0.9 * oi_ttm_for_check:
+            gp_ttm_sanity_failed = True
+            gp_ttm = None  # treat as missing so fallback fires
     # Batch 7h.15: Fallback for services companies, REITs, banks that don't report
     # GrossProfit directly. Compute from revenue minus cost of revenue when available.
     if gp_ttm is None:
@@ -1533,12 +1546,22 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
         rev_t, rev_p = _beneish_pair('revenue')
         recv_t, recv_p = _beneish_pair('receivables')
         gp_t, gp_p = _beneish_pair('gross_profit')
+        # Batch 7h.22: same accounting-identity sanity check as the TTM path.
+        # If extracted gross_profit is implausibly small relative to operating_income
+        # for the same period (OI > GP violates definitional ordering), treat as
+        # missing so the revenue - cost_of_revenue fallback can supply correct values.
+        # This is the root-cause fix for META's GMI bug and AMZN's gross-profit display.
+        oi_t_check, oi_p_check = _beneish_pair('operating_income')
+        if gp_t is not None and oi_t_check is not None and oi_t_check > 0 and gp_t < 0.9 * oi_t_check:
+            gp_t = None
+        if gp_p is not None and oi_p_check is not None and oi_p_check > 0 and gp_p < 0.9 * oi_p_check:
+            gp_p = None
         # Fallback: derive gross profit from revenue - cost_of_revenue if not direct
         if gp_t is None or gp_p is None:
             cor_t, cor_p = _beneish_pair('cost_of_revenue')
-            if rev_t is not None and cor_t is not None:
+            if gp_t is None and rev_t is not None and cor_t is not None:
                 gp_t = rev_t - cor_t
-            if rev_p is not None and cor_p is not None:
+            if gp_p is None and rev_p is not None and cor_p is not None:
                 gp_p = rev_p - cor_p
         ca_t, ca_p = _beneish_pair('current_assets')
         ppe_t, ppe_p = _beneish_pair('ppe_net')
