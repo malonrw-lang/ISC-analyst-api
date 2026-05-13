@@ -2062,6 +2062,7 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
             'dividend_yield':round((mkt.get('dividend_yield') or 0)*100, 2) if mkt.get('dividend_yield') else None,
             'eps':           eps_val,
             'book_value':    mkt.get('book_value'),
+            'shares_outstanding': last(raw.get('shares_outstanding')) or mkt.get('shares_outstanding'),
             'price_history': mkt.get('price_history', []),
             'price_simple':  'Current stock price',
             'pe_simple':     'Price-to-Earnings: what investors pay per $1 of profit. Lower is cheaper.',
