@@ -1,22 +1,7 @@
 name: Filter Lab Backtest
 
-# This workflow runs the walk-forward backtest on the 503-ticker snapshot.
-# Trigger it manually from the Actions tab in GitHub.
-#
-# Setup required (one-time):
-#   1. Commit this file to .github/workflows/backtest.yml in the
-#      malonrw-lang/ISC-analyst-api repo.
-#   2. Go to repo Settings → Secrets and variables → Actions → New repository secret.
-#      Name: TIINGO_TOKEN
-#      Value: your Tiingo Power tier API token
-#
-# To run:
-#   1. Go to the Actions tab in GitHub.
-#   2. Click "Filter Lab Backtest" in the left sidebar.
-#   3. Click "Run workflow" → green button "Run workflow".
-#   4. Wait ~25-30 minutes.
-#   5. Click into the completed run, scroll to the bottom for Artifacts.
-#   6. Download "backtest-output" — a zip containing the three result files.
+# Trigger manually from the Actions tab.
+# Setup (one-time): add TIINGO_TOKEN as a repo secret.
 
 on:
   workflow_dispatch:
@@ -26,7 +11,7 @@ on:
         required: false
         default: ''
       snapshot_date:
-        description: 'Snapshot date YYYY-MM-DD (leave blank for latest 2026-05-14)'
+        description: 'Snapshot date YYYY-MM-DD'
         required: false
         default: '2026-05-14'
 
@@ -57,9 +42,7 @@ jobs:
           fi
           echo "Using snapshot date: $SNAPSHOT_DATE"
           curl -fL -o snapshot.csv "https://raw.githubusercontent.com/malonrw-lang/isc-financial-snapshots/main/snapshots/${SNAPSHOT_DATE}.csv"
-          echo "Snapshot size:"
           wc -l snapshot.csv
-          echo "First 3 tickers:"
           head -4 snapshot.csv
 
       - name: Run backtest pipeline
@@ -89,6 +72,12 @@ jobs:
           echo ""
           echo "=== backtest_summary.txt ==="
           cat backtest_summary.txt
+          echo ""
+          echo "=== backtest_per_stock.csv (head) ==="
+          head -5 backtest_per_stock.csv
+          echo ""
+          echo "=== backtest_narratives.txt (head) ==="
+          head -60 backtest_narratives.txt
 
       - name: Upload all backtest artifacts
         uses: actions/upload-artifact@v4
@@ -98,4 +87,6 @@ jobs:
             backtest_results.csv
             backtest_summary.txt
             backtest_regime_tables.txt
+            backtest_per_stock.csv
+            backtest_narratives.txt
           retention-days: 30
