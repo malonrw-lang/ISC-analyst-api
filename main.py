@@ -27,6 +27,7 @@ from variance_score import compute_variance_score, spearman_rho
 # Daily price data fetcher with Tiingo + Stooq fallback
 # (replaces yfinance for variance score input; yfinance kept as 3rd fallback)
 from price_data import fetch_daily_prices, fetch_basic_market_metadata
+from backtest_endpoint import attach_backtest_routes
 
 app = FastAPI(
     title="ISC Analyst+ API",
@@ -41,6 +42,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+attach_backtest_routes(app)
 
 HEADERS = {'User-Agent': 'ISCAnalyst malonrw@gmail.com'}
 
