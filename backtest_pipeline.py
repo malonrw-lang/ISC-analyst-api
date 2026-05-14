@@ -1,666 +1,412 @@
-#!/usr/bin/env python3
 """
-THE FILTER LAB — Walk-Forward Backtest Pipeline (Phase 2 prototype)
-====================================================================
+backtest_pipeline.py
+====================
+Filter Lab walk-forward backtest pipeline.
 
-What this does
---------------
-Tests the central claim of the IRFA paper:
-    Structural early-warning signals computed from financial statements
-    discriminate future price behavior with greater power than traditional
-    fundamental metrics.
+For each ticker in the snapshot:
+  1. Fetch 20Q EDGAR financial history
+  2. Score at Q8 using only data through Q8 (ISC, Altman, Piotroski, Beneish, Composite)
+  3. Fetch ~5 years of daily prices
+  4. Identify observation date (the end-of-quarter date for Q8)
+  5. Compute forward stock performance at 2Q, 4Q, 8Q, 12Q horizons
+  6. Write one row per (ticker, horizon) to backtest_results.csv
 
-Methodology
------------
-For each ticker in the S&P 500 snapshot:
-  1. Pull 20Q of EDGAR data + Tiingo daily prices (uses existing pipeline)
-  2. Identify the OBSERVATION POINT — the date that ends quarter 8 of the
-     20Q EDGAR window (so observation has 8Q of history available)
-  3. Compute scores AS OF observation date using ONLY data through that date:
-       - ISC variance EWS regime
-       - Altman Z
-       - Beneish M-Score (where sector-eligible)
-       - Piotroski F
-       - Composite (≥2 of 3 lenses agree)
-  4. Look forward 2Q / 4Q / 8Q / 12Q from observation date
-  5. Record realized log return and drawdown over each lookforward horizon
-  6. Aggregate: regime → outcome distribution
+Critical methodology notes:
+  - Score is computed using ONLY data up through Q8 (no lookahead).
+  - Q8 observation date is the 'end' date of the 8th-most-recent fiscal quarter.
+  - Forward return is from obs_date to obs_date + horizon * 91 days.
+  - Sector-relative return is stock return minus average return of same
+    sector_bucket peers over the same window.
 
-Output
-------
-  results/backtest_observations.csv      — one row per ticker
-  results/backtest_summary.txt           — horse race AUC table
-  results/backtest_distressed_cohort.csv — ISC distressed list at observation
+Usage:
+  python backtest_pipeline.py --snapshot snapshot.csv [--limit N]
 
-How to run
-----------
-  # smoke test with 10 tickers (takes 2-3 minutes)
-  python3 backtest_pipeline.py --limit 10
-
-  # full S&P 500 run (takes 30-60 min depending on Tiingo throttling)
-  python3 backtest_pipeline.py
-
-  # custom ticker list
-  python3 backtest_pipeline.py --tickers AAPL MSFT GOOGL NVDA
-
-Honest caveats
---------------
-1. SURVIVORSHIP BIAS — Snapshot only contains tickers that exist today.
-   Companies that went bankrupt 2022-2025 are missing. This BIASES THE
-   TEST AGAINST the framework's hypothesis (worst outcomes excluded).
-   If signal persists despite this, real effect is stronger than measured.
-
-2. OBSERVATION DATE VARIES BY TICKER — Each ticker's observation date is
-   the end of their 8th-earliest quarter. For most S&P 500 names with full
-   20Q history, this lands roughly 2021-2022. Lookforward of 12Q lands
-   2024-2025. Final results aggregate across this calendar dispersion.
-
-3. NO REGIME RETRAINING — Threshold rules (Z<1.81, M>-1.78, etc.) are
-   canonical published values. ISC thresholds (variance EWS regime
-   classifier) come from the live pipeline as-of-the-observation logic.
-
-4. PROFITABILITY ATTRIBUTION — Outcome metrics are price-based only.
-   Dividends not reinvested. Total return ≠ price return for dividend
-   stocks; treat results as price-discrimination not total-return-prediction.
-
-Dependencies
-------------
-  - main.py (existing pipeline)
-  - variance_score.py
-  - price_data.py
-  - pandas, numpy
+Author: Ryan W. Malone
 """
-
-import argparse
-import csv
-import json
-import logging
-import math
-import os
 import sys
+import os
+import argparse
 import time
-import traceback
-from datetime import date, datetime, timedelta
+import csv
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# Import existing pipeline modules. main.py exposes the scoring functions and
-# data extraction helpers we need.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-try:
-    # Pure scoring functions — date-agnostic, take raw values
-    from main import (
-        ttm,
-        aligned_ttm_ratio,
-        is_trend_up,
-        safe_div,
-        compute_altman_z,
-        compute_piotroski,
-        compute_beneish_m_score,
-        extract_series,
-        extract_series_annual,
-        TAG_MAP,
-        FLOW_KEYS,
-    )
-    # Data fetchers
-    from price_data import fetch_daily_prices, fetch_basic_market_metadata
-    # Variance EWS — takes a price series, returns regime classification
-    from variance_score import compute_variance_score
-except ImportError as e:
-    sys.stderr.write(f"Could not import pipeline modules: {e}\n")
-    sys.stderr.write("This script must be run from the same directory as main.py.\n")
-    sys.exit(1)
-
-# ─────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────
-SNAPSHOT_CSV = Path('2026-05-14.csv')  # source of tickers + CIKs
-RESULTS_DIR = Path('backtest_results')
-RESULTS_DIR.mkdir(exist_ok=True)
-
-# Quarters into the 20Q window where observation point sits.
-# OBS_QUARTER=8 means "after 8 quarters of EDGAR data is available".
-OBS_QUARTER = 8
-
-# Forward horizons in quarters (1Q ≈ 63 trading days)
-LOOKFORWARD_HORIZONS_Q = [2, 4, 8, 12]
-
-# Minimum number of EDGAR quarters required (need OBS_QUARTER for observation,
-# plus enough lookforward in price data — the latter is checked at price layer).
-MIN_QUARTERS_REQUIRED = OBS_QUARTER + 4  # need at least 4 quarters past obs
-
-# Variance EWS rolling window matches production
-VARIANCE_WINDOW_DAYS = 252      # 1 trading year
-VARIANCE_ROLLING_WINDOW = 90    # 90-day window for regime classification
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+# Imports from the main ISC-analyst-api codebase
+from main import (
+    get_cik, get_facts, get_submissions, detect_sector, get_company_sic,
+    extract_series, TAG_MAP,
 )
-log = logging.getLogger('backtest')
+from price_data import fetch_daily_prices
+from variance_score import compute_variance_score
+
+from backtest_scorer import (
+    altman_z_at, altman_regime,
+    piotroski_at, piotroski_regime,
+    beneish_at, beneish_regime,
+    composite_regime,
+)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# EDGAR + scoring at a historical observation point
-# ─────────────────────────────────────────────────────────────────────
-def fetch_company_facts(cik):
-    """Fetch full company facts JSON from SEC EDGAR. Returns dict or None."""
-    import urllib.request
-    cik_padded = str(cik).zfill(10)
-    url = f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_padded}.json'
-    headers = {
-        'User-Agent': 'TheFilterLab Research backtest malonrw@gmail.com',
-        'Accept-Encoding': 'gzip, deflate',
-    }
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
-            if resp.headers.get('Content-Encoding') == 'gzip':
-                import gzip
-                data = gzip.decompress(data)
-            return json.loads(data)
-    except Exception as e:
-        log.warning(f'EDGAR fetch failed for CIK {cik}: {e}')
-        return None
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+TRADING_DAYS_PER_QUARTER = 63   # ≈ 252/4
+HORIZONS_Q = [2, 4, 8, 12]
 
 
-def slice_to_observation_point(series, obs_q=OBS_QUARTER):
-    """Take a pandas Series of quarterly observations and return only the
-    first `obs_q` quarters. Used to simulate "as-of" the observation date."""
-    if series is None or len(series) == 0:
-        return pd.Series(dtype=float)
-    # Series is sorted oldest → newest. First obs_q entries = pre-observation.
-    return series.iloc[:obs_q]
+def observation_date_for_q8(raw):
+    """
+    Return the calendar date of the end of Q8.
 
+    Q8 = the 8th-oldest quarter in the 20Q window. By convention here, 'first
+    8Q' means quarters 1-8 in chronological order. The observation date is the
+    'end' index of the 8th quarter — that's the latest point at which the
+    scorer is allowed to see data.
 
-def compute_observation_date(raw_series_dict, obs_q=OBS_QUARTER):
-    """Find the date corresponding to the end of quarter OBS_Q. We use the
-    revenue series as the anchor since it's the most reliable timestamp."""
-    rev = raw_series_dict.get('revenue')
-    if rev is None or len(rev) < obs_q:
-        return None
-    # Series index should be dates. Take the index of the obs_q-th entry.
-    try:
-        obs_date = rev.index[obs_q - 1]
-        # Convert pandas Timestamp to date
-        if isinstance(obs_date, pd.Timestamp):
-            return obs_date.date()
-        return obs_date
-    except Exception:
-        return None
-
-
-def build_historical_raw(facts, obs_q=OBS_QUARTER):
-    """Extract EDGAR series sliced to the first OBS_Q quarters.
-    Returns dict of pandas Series keyed by metric name."""
-    if not facts:
-        return None
-
-    # The same keys main.py extracts
-    metric_keys = [
-        'revenue', 'cost_of_revenue', 'gross_profit',
-        'operating_income', 'net_income', 'ebitda', 'da',
-        'interest_expense', 'cfo', 'cfi', 'cff', 'capex',
-        'total_assets', 'total_liabilities', 'total_equity',
-        'cash', 'total_debt', 'long_term_debt',
-        'current_assets', 'current_liabilities',
-        'retained_earnings', 'shares_outstanding',
-    ]
-
-    raw = {}
-    for k in metric_keys:
-        full = extract_series(facts, k, n=20)
-        raw[k] = slice_to_observation_point(full, obs_q)
-
-    return raw
-
-
-def compute_scores_at_observation(raw, obs_q=OBS_QUARTER):
-    """Run all four scoring systems on the sliced raw data.
-    Returns dict with regime classifications + raw scores."""
-    scores = {
-        'isc_regime': None,
-        'altman_z': None,
-        'altman_class': None,
-        'piotroski_f': None,
-        'piotroski_class': None,
-        'beneish_m': None,
-        'beneish_class': None,
-        'composite_class': None,
-    }
-
-    # --- TTM values for Altman Z inputs ---
-    rev_ttm = ttm(raw.get('revenue'))
-    oi_ttm = ttm(raw.get('operating_income'))
-    ta = raw.get('total_assets').iloc[-1] if len(raw.get('total_assets', [])) else None
-    re = raw.get('retained_earnings').iloc[-1] if len(raw.get('retained_earnings', [])) else None
-    tl = raw.get('total_liabilities').iloc[-1] if len(raw.get('total_liabilities', [])) else None
-    ca = raw.get('current_assets').iloc[-1] if len(raw.get('current_assets', [])) else None
-    cl = raw.get('current_liabilities').iloc[-1] if len(raw.get('current_liabilities', [])) else None
-
-    # market cap at observation: approximate using shares × close price at obs date.
-    # we don't have it precisely here; will be filled in from the price data layer.
-    # For now skip the mktcap-sensitive Z component by passing None and letting compute_altman_z handle it.
-
-    if all(v is not None for v in [ta, re, oi_ttm, rev_ttm, tl, ca, cl]):
-        try:
-            z = compute_altman_z(ta, re, oi_ttm, rev_ttm, tl, ca, cl, None)
-            scores['altman_z'] = z
-            if z is not None:
-                if z < 1.81: scores['altman_class'] = 'distressed'
-                elif z < 3.0: scores['altman_class'] = 'grey'
-                else: scores['altman_class'] = 'safe'
-        except Exception as e:
-            log.debug(f'altman_z compute failed: {e}')
-
-    # --- Piotroski F ---
-    cfo_ttm = ttm(raw.get('cfo'))
-    ni_ttm = ttm(raw.get('net_income'))
-    roa = safe_div(ni_ttm, ta) if (ni_ttm is not None and ta) else None
-
-    if all(v is not None for v in [roa, cfo_ttm, ni_ttm]):
-        try:
-            f, _ = compute_piotroski(
-                roa, cfo_ttm, ni_ttm,
-                is_trend_up(raw.get('net_income')),
-                is_trend_up(raw.get('long_term_debt')) == False,
-                is_trend_up(raw.get('current_assets')),
-                is_trend_up(raw.get('shares_outstanding')),
-                is_trend_up(raw.get('gross_profit')),
-                is_trend_up(raw.get('revenue')),
-            )
-            scores['piotroski_f'] = f
-            if f is not None:
-                if f <= 3: scores['piotroski_class'] = 'weak'
-                elif f <= 6: scores['piotroski_class'] = 'mixed'
-                else: scores['piotroski_class'] = 'strong'
-        except Exception as e:
-            log.debug(f'piotroski compute failed: {e}')
-
-    # --- Beneish M-Score (annual) ---
-    # Beneish uses annual data; the 8Q observation point doesn't map perfectly.
-    # We compute it from the latest 2 annual data points available at obs.
-    # For simplicity, deferring Beneish to a follow-up. Set null for now.
-    # TODO: implement Beneish from extract_series_annual sliced to obs period.
-
-    # --- Composite vote ---
-    stress_votes = 0
-    clean_votes = 0
-    n_voters = 0
-    if scores['altman_class']:
-        n_voters += 1
-        if scores['altman_class'] == 'distressed': stress_votes += 1
-        elif scores['altman_class'] == 'safe': clean_votes += 1
-    if scores['piotroski_class']:
-        n_voters += 1
-        if scores['piotroski_class'] == 'weak': stress_votes += 1
-        elif scores['piotroski_class'] == 'strong': clean_votes += 1
-    # ISC vote added after we compute it below
-
-    scores['_stress_votes'] = stress_votes
-    scores['_clean_votes'] = clean_votes
-    scores['_n_voters'] = n_voters
-
-    return scores
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Price-based: ISC variance EWS and lookforward returns
-# ─────────────────────────────────────────────────────────────────────
-def compute_isc_at_observation(price_series, obs_date):
-    """Compute variance EWS regime using only prices through obs_date."""
-    if price_series is None:
-        return None, None
-
-    # Slice to prices on or before obs_date
-    pre_obs = price_series[price_series.index <= pd.Timestamp(obs_date)]
-    if len(pre_obs) < 90:
-        return None, None
-
-    try:
-        result = compute_variance_score(
-            pre_obs,
-            window_days=VARIANCE_WINDOW_DAYS,
-            rolling_window=VARIANCE_ROLLING_WINDOW,
-        )
-        if result and 'error' not in result:
-            return result.get('regime'), result.get('mean_variance')
-    except Exception as e:
-        log.debug(f'variance_score failed: {e}')
-    return None, None
-
-
-def compute_lookforward_outcomes(price_series, obs_date, horizons_q=LOOKFORWARD_HORIZONS_Q):
-    """For each lookforward horizon, compute the realized log return and
-    max drawdown from observation date forward."""
-    outcomes = {}
-    if price_series is None:
-        for h in horizons_q:
-            outcomes[f'logret_{h}q'] = None
-            outcomes[f'maxdd_{h}q'] = None
-        return outcomes
-
-    # Price at observation
-    pre_obs = price_series[price_series.index <= pd.Timestamp(obs_date)]
-    if len(pre_obs) == 0:
-        for h in horizons_q:
-            outcomes[f'logret_{h}q'] = None
-            outcomes[f'maxdd_{h}q'] = None
-        return outcomes
-    price_at_obs = float(pre_obs.iloc[-1])
-
-    for h in horizons_q:
-        target_date = pd.Timestamp(obs_date) + pd.Timedelta(days=h * 91)  # ~91 days/quarter
-        forward = price_series[(price_series.index > pd.Timestamp(obs_date)) &
-                               (price_series.index <= target_date)]
-        if len(forward) < 10:  # need at least ~2 weeks of data
-            outcomes[f'logret_{h}q'] = None
-            outcomes[f'maxdd_{h}q'] = None
-            continue
-
-        price_at_horizon = float(forward.iloc[-1])
-        logret = math.log(price_at_horizon / price_at_obs) if price_at_obs > 0 else None
-
-        # Max drawdown over the lookforward window
-        peak = price_at_obs
-        max_dd = 0.0
-        for p in forward.values:
-            if p > peak:
-                peak = p
-            if peak > 0:
-                dd = (p - peak) / peak  # negative number
-                if dd < max_dd:
-                    max_dd = dd
-
-        outcomes[f'logret_{h}q'] = round(logret, 4) if logret is not None else None
-        outcomes[f'maxdd_{h}q'] = round(max_dd, 4)
-
-    return outcomes
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Per-ticker pipeline
-# ─────────────────────────────────────────────────────────────────────
-def backtest_ticker(ticker, cik, sector=''):
-    """Run the full backtest pipeline for one ticker.
-    Returns dict ready to write to CSV, or None if data insufficient."""
-    log.info(f'  → {ticker} (CIK {cik})')
-
-    # 1. EDGAR facts
-    facts = fetch_company_facts(cik)
-    if facts is None:
-        return {'ticker': ticker, 'status': 'edgar_fetch_failed'}
-
-    # 2. Extract sliced series
-    raw = build_historical_raw(facts, obs_q=OBS_QUARTER)
-    if raw is None:
-        return {'ticker': ticker, 'status': 'edgar_extract_failed'}
-
-    # Check we have enough quarters
+    Returns pd.Timestamp or None.
+    """
     rev = raw.get('revenue')
-    if rev is None or len(rev) < OBS_QUARTER:
-        return {'ticker': ticker, 'status': f'insufficient_history_{len(rev) if rev is not None else 0}q'}
+    if rev is None or len(rev) < 8:
+        return None
+    return rev.index[7]   # 0-indexed: position 7 is the 8th observation
 
-    # 3. Observation date = end of OBS_QUARTER
-    obs_date = compute_observation_date(raw, obs_q=OBS_QUARTER)
-    if obs_date is None:
-        return {'ticker': ticker, 'status': 'no_obs_date'}
 
-    # 4. Compute fundamental scores at observation
-    scores = compute_scores_at_observation(raw, obs_q=OBS_QUARTER)
+def compute_isc_at_q8(prices, obs_date):
+    """
+    Compute ISC variance regime using only price history up through obs_date.
 
-    # 5. Pull full daily price history (5 years gives us 8Q lookback + 12Q forward)
-    full_prices, _ = fetch_daily_prices(ticker, days=1825)
-    if full_prices is None or len(full_prices) < 90:
-        return {'ticker': ticker, 'status': 'no_price_data', 'obs_date': str(obs_date), **scores}
+    Uses the same compute_variance_score() as production, but with prices
+    truncated to obs_date.
+    """
+    if prices is None or obs_date is None:
+        return None
+    # Truncate price series to obs_date
+    truncated = prices[prices.index <= obs_date]
+    if len(truncated) < 120:   # need ~6 months minimum
+        return None
+    return compute_variance_score(truncated, window_days=252, rolling_window=90)
 
-    # 6. ISC variance EWS at observation
-    isc_regime, isc_variance = compute_isc_at_observation(full_prices, obs_date)
-    scores['isc_regime'] = isc_regime
-    scores['isc_variance'] = isc_variance
 
-    # 7. Finalize composite with ISC vote
-    if isc_regime:
-        scores['_n_voters'] += 1
-        if isc_regime == 'distressed': scores['_stress_votes'] += 1
-        elif isc_regime == 'stable': scores['_clean_votes'] += 1
+def compute_forward_stats(prices, obs_date, horizon_q):
+    """
+    Compute forward stock performance from obs_date over horizon_q quarters.
 
-    if scores['_n_voters'] >= 2:
-        if scores['_stress_votes'] >= 2: scores['composite_class'] = 'high_risk'
-        elif scores['_clean_votes'] >= 2: scores['composite_class'] = 'low_risk'
-        else: scores['composite_class'] = 'mixed'
+    Returns dict with:
+      - total_return: end price / start price - 1
+      - ann_return: annualized return
+      - max_drawdown: worst peak-to-trough (negative value)
+      - realized_vol: annualized stddev of daily log returns
+      - n_days: trading days actually covered
 
-    # 8. Lookforward outcomes
-    outcomes = compute_lookforward_outcomes(full_prices, obs_date)
+    Returns None if insufficient forward data.
+    """
+    if prices is None or obs_date is None:
+        return None
 
-    # 9. Assemble row
-    out = {
-        'ticker': ticker,
-        'cik': cik,
-        'sector': sector,
-        'obs_date': str(obs_date),
-        'status': 'ok',
-        'n_quarters_available': len(rev),
-        'isc_regime': scores.get('isc_regime'),
-        'isc_variance': scores.get('isc_variance'),
-        'altman_z': scores.get('altman_z'),
-        'altman_class': scores.get('altman_class'),
-        'piotroski_f': scores.get('piotroski_f'),
-        'piotroski_class': scores.get('piotroski_class'),
-        'beneish_m': scores.get('beneish_m'),
-        'beneish_class': scores.get('beneish_class'),
-        'composite_class': scores.get('composite_class'),
-        'composite_stress_votes': scores.get('_stress_votes'),
-        'composite_clean_votes': scores.get('_clean_votes'),
-        'composite_n_voters': scores.get('_n_voters'),
-        **outcomes,
+    # Find prices at and after obs_date
+    forward = prices[prices.index >= obs_date]
+    if len(forward) < 5:
+        return None
+
+    horizon_days = horizon_q * TRADING_DAYS_PER_QUARTER
+    forward_window = forward.iloc[:horizon_days + 1]   # +1 to include start
+
+    # Need at least 60% of expected window to be meaningful
+    if len(forward_window) < horizon_days * 0.6:
+        return None
+
+    start_price = float(forward_window.iloc[0])
+    end_price = float(forward_window.iloc[-1])
+    if start_price <= 0 or np.isnan(start_price):
+        return None
+
+    total_return = (end_price / start_price) - 1.0
+    n_days = len(forward_window) - 1
+    years = n_days / 252.0
+    ann_return = (1 + total_return) ** (1.0 / years) - 1.0 if years > 0 else None
+
+    # Max drawdown
+    running_max = forward_window.cummax()
+    drawdown_series = (forward_window - running_max) / running_max
+    max_dd = float(drawdown_series.min())
+
+    # Realized vol
+    log_returns = np.log(forward_window / forward_window.shift(1)).dropna()
+    realized_vol = float(log_returns.std() * np.sqrt(252)) if len(log_returns) >= 10 else None
+
+    return {
+        'total_return': round(total_return, 4),
+        'ann_return': round(ann_return, 4) if ann_return is not None else None,
+        'max_drawdown': round(max_dd, 4),
+        'realized_vol': round(realized_vol, 4) if realized_vol is not None else None,
+        'n_days': n_days,
     }
-    return out
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Aggregation / horse race
-# ─────────────────────────────────────────────────────────────────────
-def compute_auc(scores, labels):
-    """ROC AUC. scores: float, higher = more positive class."""
-    if not scores or len(scores) != len(labels):
-        return None
-    pairs = sorted(zip(scores, labels))
-    n_pos = sum(1 for s, l in pairs if l == 1)
-    n_neg = len(pairs) - n_pos
-    if n_pos == 0 or n_neg == 0:
-        return None
+def realized_outcome_regime(forward_stats):
+    """
+    Bucket the forward outcome into a 4-regime label that mirrors ISC's labels.
 
-    # Tied-rank Mann-Whitney
-    ranks = {}
-    i = 0
-    while i < len(pairs):
-        j = i
-        while j < len(pairs) and pairs[j][0] == pairs[i][0]:
-            j += 1
-        avg = (i + j + 1) / 2.0
-        for k in range(i, j):
-            ranks[k] = avg
-        i = j
+    Definitions (thresholds chosen to be roughly symmetric with ISC regime boundaries):
+      - stable:     total_return > 0% AND max_drawdown > -15%
+      - elevated:   total_return in [-10%, +10%] OR max_drawdown in [-30%, -15%]
+      - rising:     total_return in [-25%, -10%] OR max_drawdown in [-50%, -30%]
+      - distressed: total_return < -25% OR max_drawdown < -50%
 
-    sum_pos_ranks = sum(ranks[idx] for idx, (_, l) in enumerate(pairs) if l == 1)
-    return (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    Worst-bucket wins (if drawdown says distressed but return says elevated, → distressed).
+    """
+    if forward_stats is None:
+        return 'unknown'
+    ret = forward_stats.get('total_return')
+    dd = forward_stats.get('max_drawdown')
+    if ret is None or dd is None:
+        return 'unknown'
+
+    # Determine bucket by drawdown
+    if dd <= -0.50:
+        dd_bucket = 'distressed'
+    elif dd <= -0.30:
+        dd_bucket = 'rising'
+    elif dd <= -0.15:
+        dd_bucket = 'elevated'
+    else:
+        dd_bucket = 'stable'
+
+    # Determine bucket by return
+    if ret <= -0.25:
+        ret_bucket = 'distressed'
+    elif ret <= -0.10:
+        ret_bucket = 'rising'
+    elif ret <= 0.10:
+        ret_bucket = 'elevated'
+    else:
+        ret_bucket = 'stable'
+
+    # Worst wins
+    order = {'stable': 0, 'elevated': 1, 'rising': 2, 'distressed': 3}
+    if order[dd_bucket] >= order[ret_bucket]:
+        return dd_bucket
+    return ret_bucket
 
 
-def horse_race(results, horizons=LOOKFORWARD_HORIZONS_Q):
-    """For each (scoring system, horizon) compute AUC at discriminating
-    'large drawdown' (maxdd < -0.15)."""
-    valid = [r for r in results if r.get('status') == 'ok']
-    if not valid:
-        return []
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-ticker pipeline
+# ──────────────────────────────────────────────────────────────────────────────
 
-    races = []
-    systems = [
-        ('ISC variance EWS', 'isc_regime', {'distressed'}, {'stable'}),
-        ('Altman Z',        'altman_class', {'distressed'}, {'safe'}),
-        ('Piotroski F',     'piotroski_class', {'weak'}, {'strong'}),
-        ('Beneish M',       'beneish_class', {'flagged','watch'}, {'clean'}),
-        ('Composite',       'composite_class', {'high_risk'}, {'low_risk'}),
+def process_ticker(ticker, snapshot_row, verbose=False):
+    """
+    Run the full backtest for one ticker.
+
+    Returns list of dicts (one per horizon) ready for CSV writing, or empty list
+    on failure.
+    """
+    rows = []
+
+    # 1. CIK lookup
+    cik = snapshot_row.get('cik')
+    if not cik or pd.isna(cik):
+        cik = get_cik(ticker)
+    if not cik:
+        if verbose:
+            print(f"  {ticker}: no CIK")
+        return rows
+    # Ensure 10-digit zero-padded
+    try:
+        cik = str(int(cik)).zfill(10)
+    except (TypeError, ValueError):
+        cik = str(cik).zfill(10)
+
+    # 2. EDGAR facts
+    facts = get_facts(cik)
+    if not facts:
+        if verbose:
+            print(f"  {ticker}: no EDGAR facts")
+        return rows
+
+    # 3. Extract 20Q raw series
+    raw = {}
+    for key in TAG_MAP:
+        raw[key] = extract_series(facts, key, n=20)
+
+    rev = raw.get('revenue')
+    if rev is None or len(rev) < 12:
+        if verbose:
+            print(f"  {ticker}: insufficient revenue history ({len(rev) if rev is not None else 0}Q)")
+        return rows
+
+    # 4. Determine obs_q. We want at least 8Q lookback. Use Q8 in the
+    # chronological series (position 7, 0-indexed).
+    obs_q = 8
+    obs_date = observation_date_for_q8(raw)
+    if obs_date is None:
+        if verbose:
+            print(f"  {ticker}: no Q8 observation date")
+        return rows
+
+    # 5. Score at obs_q using only data through Q8
+    altman = altman_z_at(raw, obs_q)
+    alt_reg = altman_regime(altman)
+
+    f_score, f_signals = piotroski_at(raw, obs_q)
+    pio_reg = piotroski_regime(f_score)
+
+    m_score = beneish_at(raw, obs_q)
+    ben_reg = beneish_regime(m_score)
+
+    # 6. Fetch prices and compute ISC at Q8
+    prices, price_source = fetch_daily_prices(ticker, days=1825)   # ~5y
+    if prices is None or len(prices) < 200:
+        if verbose:
+            print(f"  {ticker}: no price data ({price_source})")
+        return rows
+
+    isc = compute_isc_at_q8(prices, obs_date)
+    if isc and 'error' not in isc:
+        isc_score = isc.get('mean_variance')
+        isc_trend = isc.get('variance_trend')
+        isc_ratio = isc.get('variance_ratio')
+        isc_reg = isc.get('regime')
+    else:
+        isc_score = isc_trend = isc_ratio = None
+        isc_reg = 'unknown'
+
+    composite_reg = composite_regime(isc_reg, alt_reg, pio_reg, ben_reg)
+
+    # 7. Sector context (from snapshot, falls back to EDGAR submissions)
+    sector_bucket = snapshot_row.get('sector_bucket')
+    if not sector_bucket or pd.isna(sector_bucket):
+        submissions = get_submissions(cik)
+        sic = get_company_sic(submissions) if submissions else None
+        sector_bucket = detect_sector(sic)
+    sector_text = snapshot_row.get('sector', '')
+
+    # 8. Forward stats at each horizon
+    for h in HORIZONS_Q:
+        fwd = compute_forward_stats(prices, obs_date, h)
+        if fwd is None:
+            continue
+        outcome_reg = realized_outcome_regime(fwd)
+
+        rows.append({
+            'ticker': ticker,
+            'sector_bucket': sector_bucket,
+            'sector': sector_text,
+            'obs_date': str(obs_date.date()),
+            'horizon_q': h,
+            # Scores
+            'isc_score': isc_score,
+            'isc_trend': isc_trend,
+            'isc_ratio': isc_ratio,
+            'isc_regime': isc_reg,
+            'altman_z': altman,
+            'altman_regime': alt_reg,
+            'piotroski_f': f_score,
+            'piotroski_regime': pio_reg,
+            'beneish_m': m_score,
+            'beneish_regime': ben_reg,
+            'composite_regime': composite_reg,
+            # Forward
+            'total_return': fwd['total_return'],
+            'ann_return': fwd['ann_return'],
+            'max_drawdown': fwd['max_drawdown'],
+            'realized_vol': fwd['realized_vol'],
+            'n_forward_days': fwd['n_days'],
+            'outcome_regime': outcome_reg,
+            # Meta
+            'price_source': price_source,
+        })
+
+    if verbose and rows:
+        # Print the 8Q row for visual sanity check
+        row_8q = next((r for r in rows if r['horizon_q'] == 8), rows[0])
+        print(f"  {ticker}: obs={row_8q['obs_date']} ISC={row_8q['isc_regime']:>10} "
+              f"Alt={row_8q['altman_regime']:>8} Pio={row_8q['piotroski_regime']:>6} "
+              f"→ ret_8q={row_8q['total_return']:+.2%} dd={row_8q['max_drawdown']:+.2%} "
+              f"outcome={row_8q['outcome_regime']}")
+    elif verbose:
+        print(f"  {ticker}: no forward stats")
+
+    return rows
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main loop
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--snapshot', default='snapshot.csv',
+                        help='Path to snapshot CSV')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='Limit to first N tickers (for smoke testing)')
+    parser.add_argument('--out', default='backtest_results.csv',
+                        help='Output CSV path')
+    parser.add_argument('--verbose', action='store_true', default=True,
+                        help='Print per-ticker progress')
+    args = parser.parse_args()
+
+    # Load snapshot
+    snap = pd.read_csv(args.snapshot)
+    print(f"Loaded {len(snap)} tickers from {args.snapshot}")
+    if args.limit:
+        snap = snap.iloc[:args.limit]
+        print(f"Limited to first {args.limit} tickers")
+
+    # Prepare output
+    out_path = Path(args.out)
+    fieldnames = [
+        'ticker', 'sector_bucket', 'sector', 'obs_date', 'horizon_q',
+        'isc_score', 'isc_trend', 'isc_ratio', 'isc_regime',
+        'altman_z', 'altman_regime',
+        'piotroski_f', 'piotroski_regime',
+        'beneish_m', 'beneish_regime',
+        'composite_regime',
+        'total_return', 'ann_return', 'max_drawdown', 'realized_vol',
+        'n_forward_days', 'outcome_regime', 'price_source',
     ]
 
-    for sys_name, key, stress_set, clean_set in systems:
-        for h in horizons:
-            outcome_key = f'maxdd_{h}q'
-            rows = [r for r in valid
-                    if r.get(key) is not None and r.get(outcome_key) is not None]
-            if len(rows) < 10:
+    n_success = 0
+    n_failed = 0
+    n_rows = 0
+    start_time = time.time()
+
+    with open(out_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for idx, snapshot_row in snap.iterrows():
+            ticker = snapshot_row['ticker']
+            if pd.isna(ticker):
                 continue
+            ticker = str(ticker).strip().upper()
 
-            # AUC: positive class = "large drawdown" (maxdd < -0.15)
-            scores = [1.0 if r[key] in stress_set else 0.0 for r in rows]
-            labels = [1 if r[outcome_key] < -0.15 else 0 for r in rows]
-            auc = compute_auc(scores, labels)
+            elapsed = time.time() - start_time
+            print(f"[{idx+1}/{len(snap)}] {ticker} (elapsed {elapsed:.0f}s, {n_success} OK, {n_failed} fail, {n_rows} rows)")
 
-            # Mean outcome by stress vs clean classification
-            stress_outcomes = [r[outcome_key] for r in rows if r[key] in stress_set]
-            clean_outcomes = [r[outcome_key] for r in rows if r[key] in clean_set]
-            mean_stress = sum(stress_outcomes)/len(stress_outcomes) if stress_outcomes else None
-            mean_clean  = sum(clean_outcomes)/len(clean_outcomes) if clean_outcomes else None
+            try:
+                rows = process_ticker(ticker, snapshot_row.to_dict(), verbose=args.verbose)
+                if rows:
+                    for r in rows:
+                        writer.writerow(r)
+                    n_rows += len(rows)
+                    n_success += 1
+                else:
+                    n_failed += 1
+            except Exception as e:
+                n_failed += 1
+                print(f"  {ticker}: EXCEPTION {type(e).__name__}: {e}")
 
-            races.append({
-                'system': sys_name,
-                'horizon_q': h,
-                'n': len(rows),
-                'auc': auc,
-                'n_stress': len(stress_outcomes),
-                'mean_maxdd_stress': mean_stress,
-                'n_clean': len(clean_outcomes),
-                'mean_maxdd_clean': mean_clean,
-                'separation': (mean_clean - mean_stress) if (mean_stress is not None and mean_clean is not None) else None,
-            })
-    return races
+            # Tiingo rate limit: pause every 50 calls
+            if (idx + 1) % 50 == 0:
+                time.sleep(2)
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────
-def main():
-    ap = argparse.ArgumentParser(description='Walk-forward backtest pipeline')
-    ap.add_argument('--limit', type=int, default=None,
-                    help='Only run first N tickers (smoke test). Default = full snapshot.')
-    ap.add_argument('--tickers', nargs='+', default=None,
-                    help='Specific tickers to backtest (overrides --limit)')
-    ap.add_argument('--snapshot', default=str(SNAPSHOT_CSV),
-                    help='Path to snapshot CSV with ticker + CIK columns')
-    args = ap.parse_args()
-
-    # Load ticker list from snapshot
-    log.info(f'Loading tickers from {args.snapshot}')
-    df = pd.read_csv(args.snapshot)
-
-    if args.tickers:
-        df = df[df['ticker'].isin([t.upper() for t in args.tickers])]
-        log.info(f'Filtered to {len(df)} specified tickers')
-    elif args.limit:
-        df = df.head(args.limit)
-        log.info(f'Limited to first {len(df)} tickers (smoke test)')
-
-    log.info(f'Running backtest on {len(df)} tickers...')
-    log.info(f'  Observation point: end of quarter {OBS_QUARTER}')
-    log.info(f'  Lookforward horizons: {LOOKFORWARD_HORIZONS_Q} quarters')
-
-    results = []
-    t0 = time.time()
-    for i, row in df.iterrows():
-        ticker = row['ticker']
-        cik = int(row['cik']) if pd.notna(row.get('cik')) else None
-        sector = row.get('sector', '')
-        if cik is None:
-            log.warning(f'  skip {ticker}: no CIK')
-            continue
-
-        try:
-            result = backtest_ticker(ticker, cik, sector)
-            if result:
-                results.append(result)
-        except Exception as e:
-            log.error(f'  {ticker} failed: {e}')
-            log.debug(traceback.format_exc())
-            results.append({'ticker': ticker, 'status': f'error:{type(e).__name__}'})
-
-        # Polite rate limit (SEC EDGAR is OK with 10/sec but we add a buffer)
-        time.sleep(0.15)
-
-        if (i+1) % 25 == 0:
-            elapsed = time.time() - t0
-            log.info(f'  progress: {i+1}/{len(df)} done in {elapsed:.0f}s ({elapsed/(i+1):.1f}s/ticker)')
-
-    elapsed = time.time() - t0
-    log.info(f'\nBacktest complete: {len(results)} tickers in {elapsed:.0f}s')
-
-    # Write per-ticker results
-    obs_csv = RESULTS_DIR / 'backtest_observations.csv'
-    fieldnames = [
-        'ticker', 'cik', 'sector', 'obs_date', 'status', 'n_quarters_available',
-        'isc_regime', 'isc_variance',
-        'altman_z', 'altman_class',
-        'piotroski_f', 'piotroski_class',
-        'beneish_m', 'beneish_class',
-        'composite_class', 'composite_stress_votes', 'composite_clean_votes', 'composite_n_voters',
-    ] + [f'logret_{h}q' for h in LOOKFORWARD_HORIZONS_Q] + [f'maxdd_{h}q' for h in LOOKFORWARD_HORIZONS_Q]
-
-    with obs_csv.open('w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-        w.writeheader()
-        for r in results:
-            w.writerow(r)
-    log.info(f'Wrote {obs_csv}')
-
-    # Horse race summary
-    races = horse_race(results)
-    summary_path = RESULTS_DIR / 'backtest_summary.txt'
-    with summary_path.open('w') as f:
-        f.write('='*78 + '\n')
-        f.write(f'THE FILTER LAB — WALK-FORWARD BACKTEST SUMMARY\n')
-        f.write(f'Generated: {datetime.now().isoformat()}\n')
-        f.write(f'Tickers attempted: {len(df)}\n')
-        f.write(f'Successful observations: {sum(1 for r in results if r.get("status") == "ok")}\n')
-        f.write(f'Observation point: end of quarter {OBS_QUARTER}\n')
-        f.write('='*78 + '\n\n')
-
-        f.write('Horse race — AUC for "regime predicts maxdd < -15%" by horizon\n')
-        f.write('-'*78 + '\n')
-        f.write(f'{"System":<22} {"Horizon":>8} {"N":>5} {"AUC":>6} {"MeanDD_stress":>14} {"MeanDD_clean":>13} {"Sep":>6}\n')
-        f.write('-'*78 + '\n')
-        for r in races:
-            auc = f'{r["auc"]:.3f}' if r['auc'] is not None else '   --'
-            ms  = f'{r["mean_maxdd_stress"]:>+.1%}' if r['mean_maxdd_stress'] is not None else '       --'
-            mc  = f'{r["mean_maxdd_clean"]:>+.1%}'  if r['mean_maxdd_clean']  is not None else '       --'
-            sp  = f'{r["separation"]:>+.1%}' if r['separation'] is not None else '    --'
-            f.write(f'{r["system"]:<22} {r["horizon_q"]:>4}Q   {r["n"]:>5} {auc:>6} {ms:>14} {mc:>13} {sp:>6}\n')
-
-        f.write('\n')
-        f.write('Interpretation:\n')
-        f.write('  - AUC > 0.65: strong discriminative power\n')
-        f.write('  - AUC 0.55-0.65: modest discriminative power\n')
-        f.write('  - AUC ≈ 0.50: chance (no signal)\n')
-        f.write('  - Sep column: how much MORE drawdown stress-class shows vs clean-class.\n')
-        f.write('    Negative sep = stress class shows BIGGER drawdown (signal in expected direction).\n')
-
-    log.info(f'Wrote {summary_path}')
-
-    # Print summary to stdout too
-    print('\n' + summary_path.read_text())
-
-    # ISC distressed cohort detail
-    distressed = [r for r in results if r.get('isc_regime') == 'distressed' and r.get('status') == 'ok']
-    if distressed:
-        dpath = RESULTS_DIR / 'backtest_distressed_cohort.csv'
-        with dpath.open('w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-            w.writeheader()
-            for r in distressed:
-                w.writerow(r)
-        log.info(f'Wrote {dpath} ({len(distressed)} tickers ISC-distressed at observation)')
+    elapsed = time.time() - start_time
+    print(f"\nDone. {n_success} tickers succeeded, {n_failed} failed, {n_rows} total rows.")
+    print(f"Elapsed: {elapsed:.0f}s ({elapsed/60:.1f}min)")
+    print(f"Output: {out_path}")
 
 
 if __name__ == '__main__':
