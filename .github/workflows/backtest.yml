@@ -1,0 +1,101 @@
+name: Filter Lab Backtest
+
+# This workflow runs the walk-forward backtest on the 503-ticker snapshot.
+# Trigger it manually from the Actions tab in GitHub.
+#
+# Setup required (one-time):
+#   1. Commit this file to .github/workflows/backtest.yml in the
+#      malonrw-lang/ISC-analyst-api repo.
+#   2. Go to repo Settings → Secrets and variables → Actions → New repository secret.
+#      Name: TIINGO_TOKEN
+#      Value: your Tiingo Power tier API token
+#
+# To run:
+#   1. Go to the Actions tab in GitHub.
+#   2. Click "Filter Lab Backtest" in the left sidebar.
+#   3. Click "Run workflow" → green button "Run workflow".
+#   4. Wait ~25-30 minutes.
+#   5. Click into the completed run, scroll to the bottom for Artifacts.
+#   6. Download "backtest-output" — a zip containing the three result files.
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Limit to first N tickers (leave blank for full 503)'
+        required: false
+        default: ''
+      snapshot_date:
+        description: 'Snapshot date YYYY-MM-DD (leave blank for latest 2026-05-14)'
+        required: false
+        default: '2026-05-14'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout ISC-analyst-api repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas numpy requests fastapi
+
+      - name: Download snapshot CSV
+        run: |
+          SNAPSHOT_DATE="${{ github.event.inputs.snapshot_date }}"
+          if [ -z "$SNAPSHOT_DATE" ]; then
+            SNAPSHOT_DATE="2026-05-14"
+          fi
+          echo "Using snapshot date: $SNAPSHOT_DATE"
+          curl -fL -o snapshot.csv "https://raw.githubusercontent.com/malonrw-lang/isc-financial-snapshots/main/snapshots/${SNAPSHOT_DATE}.csv"
+          echo "Snapshot size:"
+          wc -l snapshot.csv
+          echo "First 3 tickers:"
+          head -4 snapshot.csv
+
+      - name: Run backtest pipeline
+        env:
+          TIINGO_TOKEN: ${{ secrets.TIINGO_TOKEN }}
+        run: |
+          LIMIT="${{ github.event.inputs.limit }}"
+          if [ -z "$LIMIT" ]; then
+            echo "Running full backtest (no limit)"
+            python backtest_pipeline.py --snapshot snapshot.csv
+          else
+            echo "Running with limit=$LIMIT"
+            python backtest_pipeline.py --snapshot snapshot.csv --limit "$LIMIT"
+          fi
+
+      - name: Show results summary
+        run: |
+          echo "=== backtest_results.csv ==="
+          wc -l backtest_results.csv
+          echo ""
+          echo "=== First 3 rows ==="
+          head -4 backtest_results.csv
+
+      - name: Run analyzer
+        run: |
+          python backtest_analyze.py
+          echo ""
+          echo "=== backtest_summary.txt ==="
+          cat backtest_summary.txt
+
+      - name: Upload all backtest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-output
+          path: |
+            backtest_results.csv
+            backtest_summary.txt
+            backtest_regime_tables.txt
+          retention-days: 30
