@@ -426,66 +426,99 @@ def fmt_sector_rel(v):
     return f"{sign} sector peers by {abs(v)*100:.1f}pp"
 
 
+def safe_label(v, default='UNKNOWN'):
+    """Return uppercase string label even when CSV gives us NaN/None/float.
+    pandas hands us NaN floats for missing string cells, which break .upper().
+    """
+    if v is None:
+        return default
+    try:
+        if pd.isna(v):
+            return default
+    except (TypeError, ValueError):
+        pass
+    if not isinstance(v, str):
+        return default
+    return v.upper()
+
+
+def safe_num(v):
+    """Return v if it's a real number, else None. Handles NaN."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, (int, float)):
+        return v
+    return None
+
+
 def narrate_ticker(per_stock_row):
     """Generate a multi-line narrative paragraph for one ticker."""
     t = per_stock_row['ticker']
-    sector = per_stock_row.get('sector') or per_stock_row.get('sector_bucket')
+    sector = per_stock_row.get('sector') or per_stock_row.get('sector_bucket') or ''
+    if not isinstance(sector, str):
+        sector = ''
     obs_date = per_stock_row['obs_date']
 
-    isc = per_stock_row.get('isc_regime', 'unknown')
-    isc_v = per_stock_row.get('isc_score')
-    isc_t = per_stock_row.get('isc_trend')
-    alt = per_stock_row.get('altman_regime', 'unknown')
-    alt_z = per_stock_row.get('altman_z')
-    pio = per_stock_row.get('piotroski_regime', 'unknown')
-    pio_f = per_stock_row.get('piotroski_f')
-    ben = per_stock_row.get('beneish_regime', 'unknown')
-    comp = per_stock_row.get('composite_regime', 'unknown')
-    closest = per_stock_row.get('closest_aligned_framework_8q', 'N/A')
+    isc = safe_label(per_stock_row.get('isc_regime'))
+    isc_v = safe_num(per_stock_row.get('isc_score'))
+    isc_t = safe_num(per_stock_row.get('isc_trend'))
+    alt = safe_label(per_stock_row.get('altman_regime'))
+    alt_z = safe_num(per_stock_row.get('altman_z'))
+    pio = safe_label(per_stock_row.get('piotroski_regime'))
+    pio_f = safe_num(per_stock_row.get('piotroski_f'))
+    ben = safe_label(per_stock_row.get('beneish_regime'))
+    comp = safe_label(per_stock_row.get('composite_regime'))
+    closest = per_stock_row.get('closest_aligned_framework_8q')
+    if closest is None or (not isinstance(closest, str) and pd.isna(closest)):
+        closest = 'N/A'
 
-    ret_4q = per_stock_row.get('total_return_4q')
-    ret_8q = per_stock_row.get('total_return_8q')
-    ret_12q = per_stock_row.get('total_return_12q')
-    dd_8q = per_stock_row.get('max_drawdown_8q')
-    dd_12q = per_stock_row.get('max_drawdown_12q')
+    ret_4q = safe_num(per_stock_row.get('total_return_4q'))
+    ret_8q = safe_num(per_stock_row.get('total_return_8q'))
+    ret_12q = safe_num(per_stock_row.get('total_return_12q'))
+    dd_8q = safe_num(per_stock_row.get('max_drawdown_8q'))
+    dd_12q = safe_num(per_stock_row.get('max_drawdown_12q'))
     secrel_4q = per_stock_row.get('sector_relative_return_4q')
     secrel_8q = per_stock_row.get('sector_relative_return_8q')
     secrel_12q = per_stock_row.get('sector_relative_return_12q')
-    outcome_4q = per_stock_row.get('outcome_regime_4q', 'unknown')
-    outcome_8q = per_stock_row.get('outcome_regime_8q', 'unknown')
-    outcome_12q = per_stock_row.get('outcome_regime_12q', 'unknown')
+    outcome_4q = safe_label(per_stock_row.get('outcome_regime_4q'))
+    outcome_8q = safe_label(per_stock_row.get('outcome_regime_8q'))
+    outcome_12q = safe_label(per_stock_row.get('outcome_regime_12q'))
 
     lines = []
     lines.append(f"━━━ {t} ({sector}) — Q8 obs date: {obs_date} ━━━")
     lines.append(f"")
     lines.append(f"  At observation (using only data through {obs_date}):")
-    lines.append(f"    ISC:        {isc.upper():<14}"
+    lines.append(f"    ISC:        {isc:<14}"
                  + (f"  variance={isc_v:.4f}  trend={isc_t:.2f}" if isc_v is not None and isc_t is not None else ""))
-    lines.append(f"    Altman Z:   {alt.upper():<14}"
+    lines.append(f"    Altman Z:   {alt:<14}"
                  + (f"  Z={alt_z:.2f}" if alt_z is not None else ""))
-    lines.append(f"    Piotroski:  {pio.upper():<14}"
-                 + (f"  F={pio_f}/9" if pio_f is not None else ""))
-    lines.append(f"    Beneish M:  {ben.upper():<14}")
-    lines.append(f"    Composite:  {comp.upper():<14}")
+    lines.append(f"    Piotroski:  {pio:<14}"
+                 + (f"  F={int(pio_f)}/9" if pio_f is not None else ""))
+    lines.append(f"    Beneish M:  {ben:<14}")
+    lines.append(f"    Composite:  {comp:<14}")
     lines.append(f"")
     lines.append(f"  What happened next:")
     if ret_4q is not None:
-        lines.append(f"    4Q forward:  {ret_4q*100:+.1f}%  ({fmt_sector_rel(secrel_4q)})  → realized: {outcome_4q.upper()}")
+        lines.append(f"    4Q forward:  {ret_4q*100:+.1f}%  ({fmt_sector_rel(secrel_4q)})  → realized: {outcome_4q}")
     if ret_8q is not None and dd_8q is not None:
-        lines.append(f"    8Q forward:  {ret_8q*100:+.1f}%  max drawdown {dd_8q*100:+.1f}%  ({fmt_sector_rel(secrel_8q)})  → realized: {outcome_8q.upper()}")
+        lines.append(f"    8Q forward:  {ret_8q*100:+.1f}%  max drawdown {dd_8q*100:+.1f}%  ({fmt_sector_rel(secrel_8q)})  → realized: {outcome_8q}")
     if ret_12q is not None and dd_12q is not None:
-        lines.append(f"   12Q forward:  {ret_12q*100:+.1f}%  max drawdown {dd_12q*100:+.1f}%  ({fmt_sector_rel(secrel_12q)})  → realized: {outcome_12q.upper()}")
+        lines.append(f"   12Q forward:  {ret_12q*100:+.1f}%  max drawdown {dd_12q*100:+.1f}%  ({fmt_sector_rel(secrel_12q)})  → realized: {outcome_12q}")
     lines.append(f"")
     lines.append(f"  Quarter-by-quarter trajectory:")
-    # Split into two rows of 6 for readability
     q_line_1 = "    " + "  ".join(
-        f"Q+{q}: {(per_stock_row.get(f'q{q}_return') or 0)*100:+5.1f}%"
-        if per_stock_row.get(f'q{q}_return') is not None else f"Q+{q}:    —  "
+        f"Q+{q}: {safe_num(per_stock_row.get(f'q{q}_return'))*100:+5.1f}%"
+        if safe_num(per_stock_row.get(f'q{q}_return')) is not None else f"Q+{q}:    —  "
         for q in range(1, 7)
     )
     q_line_2 = "    " + "  ".join(
-        f"Q+{q}: {(per_stock_row.get(f'q{q}_return') or 0)*100:+5.1f}%"
-        if per_stock_row.get(f'q{q}_return') is not None else f"Q+{q}:    —  "
+        f"Q+{q}: {safe_num(per_stock_row.get(f'q{q}_return'))*100:+5.1f}%"
+        if safe_num(per_stock_row.get(f'q{q}_return')) is not None else f"Q+{q}:    —  "
         for q in range(7, 13)
     )
     lines.append(q_line_1)
