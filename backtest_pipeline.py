@@ -1,30 +1,36 @@
 """
-backtest_pipeline.py — v2
-=========================
+backtest_pipeline.py — v3 (rolling obs_q)
+==========================================
 Filter Lab walk-forward backtest pipeline.
 
-CHANGES from v1:
-  - Added 1Q horizon (was 2/4/8/12; now 1/2/4/8/12)
-  - Added per-quarter forward returns (q1_return, q2_return, ..., q12_return)
-    showing the return inside each individual quarter from obs_date forward.
-    Same values repeated across the 5 horizon rows for a ticker, which makes
-    pandas/Excel filtering trivially easy.
-  - Added sector_relative_return: stock's return minus the mean return of
-    same-sector_bucket peers at the same horizon. Computed in a second pass
-    after all per-ticker rows are collected, since we need the sector means.
+CHANGES from v2:
+  - ROLLING OBS_Q: each ticker now generates rows at multiple observation
+    quarters: obs_q ∈ [8, 10, 12, 14, 16]. Previously every ticker was
+    pinned to obs_q=8 (earliest valid observation). Now we get up to 5
+    observations per ticker — roughly 5× the sample size.
+  - Generalized observation_date_for_q8(raw) → observation_date_at(raw, obs_q)
+  - Added obs_q column to CSV output. Each (ticker, obs_q, horizon) is now a
+    unique row. ~2,400 total rows expected for 478-ticker universe (vs ~1,400 before).
+  - Sector-relative returns now compute peer means within (sector, obs_q, horizon)
+    instead of (sector, horizon), so peers are time-matched and the relative-
+    return signal isn't contaminated by obs_q clustering.
+  - Skips obs_q values that don't have enough forward price data (e.g. a 20Q
+    history ticker with obs_q=16 has only 4Q forward window, not enough for
+    the 12Q horizon).
 
-For each ticker in the snapshot:
+For each ticker in the snapshot, for each valid obs_q in OBS_Q_VALUES:
   1. Fetch 20Q EDGAR financial history
-  2. Score at Q8 using only data through Q8 (ISC, Altman, Piotroski, Beneish, Composite)
+  2. Score at obs_q using only data through obs_q (ISC, Altman, Piotroski, Beneish, Composite)
   3. Fetch ~5 years of daily prices
-  4. Identify observation date (the end-of-quarter date for Q8)
+  4. Identify observation date (the end-of-quarter date for that obs_q)
   5. Compute forward stock performance at 1Q, 2Q, 4Q, 8Q, 12Q horizons
   6. Decompose return into per-quarter chunks
-  7. After loop: compute sector means per horizon, derive sector_relative_return
-  8. Write one row per (ticker, horizon) to backtest_results.csv
+  7. Skip obs_q if forward price data is insufficient
+  After loop: compute sector means per (obs_q, horizon), derive sector_relative_return
 
 Usage:
   python backtest_pipeline.py --snapshot snapshot.csv [--limit N]
+  python backtest_pipeline.py --snapshot snapshot.csv --obs-q 8,12,16
 
 Author: Ryan W. Malone
 """
@@ -62,17 +68,26 @@ TRADING_DAYS_PER_QUARTER = 63   # ≈ 252/4
 HORIZONS_Q = [1, 2, 4, 8, 12]
 MAX_QUARTERS = max(HORIZONS_Q)   # 12 — number of per-quarter columns
 
+# Rolling observation quarters. Each ticker is scored at every obs_q in this
+# list where its EDGAR history is long enough AND its forward price window
+# is long enough to compute the 12Q horizon.
+#   - obs_q must be ≥ 8 (scorer requires 8 quarters of look-back for Beneish)
+#   - obs_q + 12 ≤ EDGAR history length (need 12Q forward fundamental context)
+#   - obs_date + 12 quarters ≤ price data end (need forward price window)
+DEFAULT_OBS_Q_VALUES = [8, 10, 12, 14, 16]
 
-def observation_date_for_q8(raw):
-    """Return the calendar date of the end of Q8."""
+
+def observation_date_at(raw, obs_q):
+    """Return the calendar date of the end of obs_q (1-indexed quarter)."""
     rev = raw.get('revenue')
-    if rev is None or len(rev) < 8:
+    if rev is None or len(rev) < obs_q:
         return None
-    return rev.index[7]
+    return rev.index[obs_q - 1]
 
 
-def compute_isc_at_q8(prices, obs_date):
-    """ISC variance regime using only price history through obs_date."""
+def compute_isc_at(prices, obs_date):
+    """ISC variance regime using only price history through obs_date.
+    Renamed from compute_isc_at_q8 — now works at any obs_date."""
     if prices is None or obs_date is None:
         return None
     truncated = prices[prices.index <= obs_date]
@@ -196,48 +211,42 @@ def realized_outcome_regime(forward_stats):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-ticker pipeline
+# Per-ticker, per-obs_q pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
-def process_ticker(ticker, snapshot_row, verbose=False):
-    """Run the full backtest for one ticker."""
+def score_at_obs_q(ticker, raw, prices, snapshot_row, obs_q,
+                   sector_bucket, sector_text, price_source, verbose=False):
+    """
+    Run framework scoring + forward-stats at one obs_q.
+    Returns a list of rows (one per horizon) or [] if obs_q is invalid for
+    this ticker (insufficient EDGAR or insufficient forward price data).
+    """
     rows = []
 
-    cik = snapshot_row.get('cik')
-    if not cik or pd.isna(cik):
-        cik = get_cik(ticker)
-    if not cik:
-        if verbose:
-            print(f"  {ticker}: no CIK")
-        return rows
-    try:
-        cik = str(int(cik)).zfill(10)
-    except (TypeError, ValueError):
-        cik = str(cik).zfill(10)
-
-    facts = get_facts(cik)
-    if not facts:
-        if verbose:
-            print(f"  {ticker}: no EDGAR facts")
-        return rows
-
-    raw = {}
-    for key in TAG_MAP:
-        raw[key] = extract_series(facts, key, n=20)
-
+    # Check we have enough EDGAR history for this obs_q
     rev = raw.get('revenue')
-    if rev is None or len(rev) < 12:
+    if rev is None or len(rev) < obs_q:
         if verbose:
-            print(f"  {ticker}: insufficient revenue history ({len(rev) if rev is not None else 0}Q)")
+            print(f"  {ticker} @ obs_q={obs_q}: insufficient EDGAR history "
+                  f"({len(rev) if rev is not None else 0}Q)")
         return rows
 
-    obs_q = 8
-    obs_date = observation_date_for_q8(raw)
+    obs_date = observation_date_at(raw, obs_q)
     if obs_date is None:
-        if verbose:
-            print(f"  {ticker}: no Q8 observation date")
         return rows
 
+    # Check we have enough forward price data for the 12Q horizon
+    # (Otherwise this obs_q is wasted — most horizons won't compute)
+    if prices is not None:
+        forward = prices[prices.index >= obs_date]
+        min_forward_days = MAX_QUARTERS * TRADING_DAYS_PER_QUARTER * 0.6
+        if len(forward) < min_forward_days:
+            if verbose:
+                print(f"  {ticker} @ obs_q={obs_q}: only {len(forward)}d forward "
+                      f"price data (need {min_forward_days:.0f}d for 12Q horizon)")
+            return rows
+
+    # Score frameworks at this obs_q
     altman = altman_z_at(raw, obs_q)
     alt_reg = altman_regime(altman)
 
@@ -247,13 +256,7 @@ def process_ticker(ticker, snapshot_row, verbose=False):
     m_score = beneish_at(raw, obs_q)
     ben_reg = beneish_regime(m_score)
 
-    prices, price_source = fetch_daily_prices(ticker, days=1825)
-    if prices is None or len(prices) < 200:
-        if verbose:
-            print(f"  {ticker}: no price data ({price_source})")
-        return rows
-
-    isc = compute_isc_at_q8(prices, obs_date)
+    isc = compute_isc_at(prices, obs_date)
     if isc and 'error' not in isc:
         isc_score = isc.get('mean_variance')
         isc_trend = isc.get('variance_trend')
@@ -265,14 +268,7 @@ def process_ticker(ticker, snapshot_row, verbose=False):
 
     composite_reg = composite_regime(isc_reg, alt_reg, pio_reg, ben_reg)
 
-    sector_bucket = snapshot_row.get('sector_bucket')
-    if not sector_bucket or pd.isna(sector_bucket):
-        submissions = get_submissions(cik)
-        sic = get_company_sic(submissions) if submissions else None
-        sector_bucket = detect_sector(sic)
-    sector_text = snapshot_row.get('sector', '')
-
-    # Per-quarter returns — once per ticker, broadcast across horizons
+    # Per-quarter returns — once per (ticker, obs_q), broadcast across horizons
     quarter_returns = compute_per_quarter_returns(prices, obs_date, MAX_QUARTERS)
 
     for h in HORIZONS_Q:
@@ -286,6 +282,7 @@ def process_ticker(ticker, snapshot_row, verbose=False):
             'sector_bucket': sector_bucket,
             'sector': sector_text,
             'obs_date': str(obs_date.date()),
+            'obs_q': obs_q,
             'horizon_q': h,
             'isc_score': isc_score,
             'isc_trend': isc_trend,
@@ -313,41 +310,104 @@ def process_ticker(ticker, snapshot_row, verbose=False):
 
     if verbose and rows:
         row_8q = next((r for r in rows if r['horizon_q'] == 8), rows[0])
-        q1 = row_8q.get('q1_return') or 0
-        q4 = row_8q.get('q4_return') or 0
-        q8 = row_8q.get('q8_return') or 0
-        print(f"  {ticker}: obs={row_8q['obs_date']} ISC={row_8q['isc_regime']:>10} "
-              f"Alt={row_8q['altman_regime']:>8} → 8Q ret={row_8q['total_return']:+.2%} "
-              f"dd={row_8q['max_drawdown']:+.2%} "
-              f"q1={q1*100:+.1f}% q4={q4*100:+.1f}% q8={q8*100:+.1f}% "
+        print(f"  {ticker} @ obs_q={obs_q} ({row_8q['obs_date']}): "
+              f"ISC={row_8q['isc_regime']:>10} Alt={row_8q['altman_regime']:>8} "
+              f"→ 8Q ret={row_8q['total_return']:+.2%} "
               f"outcome={row_8q['outcome_regime']}")
-    elif verbose:
-        print(f"  {ticker}: no forward stats")
 
     return rows
 
 
+def process_ticker(ticker, snapshot_row, obs_q_values, verbose=False):
+    """Run the full backtest for one ticker across all valid obs_q values."""
+    cik = snapshot_row.get('cik')
+    if not cik or pd.isna(cik):
+        cik = get_cik(ticker)
+    if not cik:
+        if verbose:
+            print(f"  {ticker}: no CIK")
+        return []
+    try:
+        cik = str(int(cik)).zfill(10)
+    except (TypeError, ValueError):
+        cik = str(cik).zfill(10)
+
+    facts = get_facts(cik)
+    if not facts:
+        if verbose:
+            print(f"  {ticker}: no EDGAR facts")
+        return []
+
+    raw = {}
+    for key in TAG_MAP:
+        raw[key] = extract_series(facts, key, n=20)
+
+    rev = raw.get('revenue')
+    if rev is None or len(rev) < 12:
+        if verbose:
+            print(f"  {ticker}: insufficient revenue history ({len(rev) if rev is not None else 0}Q)")
+        return []
+
+    # Fetch sector once per ticker
+    sector_bucket = snapshot_row.get('sector_bucket')
+    if not sector_bucket or pd.isna(sector_bucket):
+        submissions = get_submissions(cik)
+        sic = get_company_sic(submissions) if submissions else None
+        sector_bucket = detect_sector(sic)
+    sector_text = snapshot_row.get('sector', '')
+
+    # Fetch prices once per ticker — same 5-year window covers all obs_q values
+    prices, price_source = fetch_daily_prices(ticker, days=1825)
+    if prices is None or len(prices) < 200:
+        if verbose:
+            print(f"  {ticker}: no price data ({price_source})")
+        return []
+
+    # Loop over obs_q values — score at each valid one
+    all_rows = []
+    for obs_q in obs_q_values:
+        obs_rows = score_at_obs_q(
+            ticker, raw, prices, snapshot_row, obs_q,
+            sector_bucket, sector_text, price_source, verbose=verbose
+        )
+        all_rows.extend(obs_rows)
+
+    if verbose and not all_rows:
+        print(f"  {ticker}: no valid obs_q produced rows")
+
+    return all_rows
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Sector-relative computation (second pass)
+# Sector-relative computation (second pass) — now grouped by obs_q too
 # ──────────────────────────────────────────────────────────────────────────────
 
 def add_sector_relative_returns(all_rows):
     """
-    Compute sector_relative_return = total_return - mean(sector peers @ same horizon).
+    Compute sector_relative_return = total_return - mean(sector peers @ same obs_q, horizon).
     Modifies rows in place.
+
+    GROUPING CHANGE from v2: now groups by (sector, obs_q, horizon) so peers
+    are time-matched. Previously grouped by (sector, horizon) which silently
+    mixed obs_q cohorts.
     """
     df = pd.DataFrame(all_rows)
     if len(df) == 0:
         return
-    sector_means = df.groupby(['sector_bucket', 'horizon_q'])['total_return'].mean().to_dict()
+    sector_means = df.groupby(['sector_bucket', 'obs_q', 'horizon_q'])['total_return'].mean().to_dict()
 
-    print("\nSector mean returns by horizon:")
-    for (sec, h), m in sorted(sector_means.items()):
-        n = ((df['sector_bucket'] == sec) & (df['horizon_q'] == h)).sum()
-        print(f"  {sec:<14} {h:>2}Q  N={n:>4}  mean={m*100:+7.2f}%")
+    print("\nSector mean returns by (sector, obs_q, horizon):")
+    print("(Showing 8Q horizon only for brevity)")
+    for (sec, oq, h), m in sorted(sector_means.items()):
+        if h != 8:
+            continue
+        n = ((df['sector_bucket'] == sec) &
+             (df['obs_q'] == oq) &
+             (df['horizon_q'] == h)).sum()
+        print(f"  {sec:<14} obs_q={oq:>2} {h:>2}Q  N={n:>4}  mean={m*100:+7.2f}%")
 
     for row in all_rows:
-        key = (row['sector_bucket'], row['horizon_q'])
+        key = (row['sector_bucket'], row['obs_q'], row['horizon_q'])
         sector_mean = sector_means.get(key)
         if sector_mean is not None and row['total_return'] is not None:
             row['sector_relative_return'] = round(row['total_return'] - sector_mean, 4)
@@ -363,7 +423,20 @@ def main():
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--out', default='backtest_results.csv')
     parser.add_argument('--verbose', action='store_true', default=True)
+    parser.add_argument('--obs-q', default=None,
+                        help='Comma-separated obs_q values to score at (default: '
+                             f'{",".join(map(str, DEFAULT_OBS_Q_VALUES))})')
     args = parser.parse_args()
+
+    # Parse obs_q values
+    if args.obs_q:
+        obs_q_values = [int(x.strip()) for x in args.obs_q.split(',') if x.strip()]
+    else:
+        obs_q_values = DEFAULT_OBS_Q_VALUES
+
+    print(f"Scoring at obs_q values: {obs_q_values}")
+    print(f"(Each ticker can produce up to {len(obs_q_values)} × {len(HORIZONS_Q)} "
+          f"= {len(obs_q_values) * len(HORIZONS_Q)} rows if all obs_q valid)")
 
     snap = pd.read_csv(args.snapshot)
     print(f"Loaded {len(snap)} tickers from {args.snapshot}")
@@ -372,7 +445,7 @@ def main():
         print(f"Limited to first {args.limit} tickers")
 
     fieldnames = [
-        'ticker', 'sector_bucket', 'sector', 'obs_date', 'horizon_q',
+        'ticker', 'sector_bucket', 'sector', 'obs_date', 'obs_q', 'horizon_q',
         'isc_score', 'isc_trend', 'isc_ratio', 'isc_regime',
         'altman_z', 'altman_regime',
         'piotroski_f', 'piotroski_regime',
@@ -395,10 +468,12 @@ def main():
         ticker = str(ticker).strip().upper()
 
         elapsed = time.time() - start_time
-        print(f"[{idx+1}/{len(snap)}] {ticker} (elapsed {elapsed:.0f}s, {n_success} OK, {n_failed} fail, {len(all_rows)} rows)")
+        print(f"[{idx+1}/{len(snap)}] {ticker} (elapsed {elapsed:.0f}s, "
+              f"{n_success} OK, {n_failed} fail, {len(all_rows)} rows)")
 
         try:
-            rows = process_ticker(ticker, snapshot_row.to_dict(), verbose=args.verbose)
+            rows = process_ticker(ticker, snapshot_row.to_dict(),
+                                  obs_q_values, verbose=args.verbose)
             if rows:
                 all_rows.extend(rows)
                 n_success += 1
@@ -424,7 +499,8 @@ def main():
             writer.writerow(row)
 
     elapsed = time.time() - start_time
-    print(f"\nDone. {n_success} tickers succeeded, {n_failed} failed, {len(all_rows)} total rows.")
+    print(f"\nDone. {n_success} tickers succeeded, {n_failed} failed, "
+          f"{len(all_rows)} total rows.")
     print(f"Elapsed: {elapsed:.0f}s ({elapsed/60:.1f}min)")
     print(f"Output: {out_path}")
 
