@@ -172,27 +172,6 @@ def fetch_basic_market_metadata(ticker: str) -> dict:
             data = r.json()
             out['company_name'] = data.get('name') or ticker
             out['description'] = data.get('description', '')[:300] if data.get('description') else ''
-            
-        # Latest price from prices endpoint
-        prices_url = 'https://api.tiingo.com/tiingo/daily/{}/prices'.format(ticker.lower())
-        end_date = pd.Timestamp.now()
-        start_date = end_date - pd.Timedelta(days=400)
-        r2 = requests.get(prices_url, params={
-            'startDate': start_date.strftime('%Y-%m-%d'),
-            'endDate':   end_date.strftime('%Y-%m-%d'),
-            'token':     TIINGO_TOKEN,
-        }, timeout=TIMEOUT_SEC)
-        if r2.status_code == 200:
-            data = r2.json()
-            if isinstance(data, list) and len(data) > 0:
-                latest = data[-1]
-                out['price'] = round(float(latest.get('adjClose', 0)), 2) if latest.get('adjClose') else None
-                # 52-week high/low
-                window_252 = data[-252:] if len(data) >= 252 else data
-                closes = [float(d.get('adjClose', 0)) for d in window_252 if d.get('adjClose')]
-                if closes:
-                    out['high_52w'] = round(max(closes), 2)
-                    out['low_52w'] = round(min(closes), 2)
     except Exception:
         pass
     
