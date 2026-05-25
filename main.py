@@ -12,6 +12,7 @@ import requests
 import numpy as np
 import pandas as pd
 import json
+import time
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -199,12 +200,36 @@ def get_company_sic(submissions):
 
 
 # ── EDGAR helpers ──────────────────────────────────────────────────────────────
+def _edgar_get(url, timeout=30, max_retries=3):
+    """GET with SEC User-Agent + backoff on 429/503. Returns Response or None.
+    Preserves the existing None-on-failure contract; only ADDS retry on rate-limit."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            return None
+        if r.status_code in (429, 503):
+            wait = r.headers.get('Retry-After')
+            try:
+                wait = float(wait) if wait else (2 ** attempt)
+            except (TypeError, ValueError):
+                wait = 2 ** attempt
+            if attempt < max_retries - 1:
+                time.sleep(min(wait, 10))
+                continue
+            return None
+        return r
+    return None
+
+
 def get_cik(ticker: str):
     try:
-        r = requests.get(
-            'https://www.sec.gov/files/company_tickers.json',
-            headers=HEADERS, timeout=15
-        )
+        r = _edgar_get('https://www.sec.gov/files/company_tickers.json', timeout=15)
+        if r is None:
+            return None
         data = r.json()
         for entry in data.values():
             if entry['ticker'].upper() == ticker.upper():
@@ -215,11 +240,8 @@ def get_cik(ticker: str):
 
 def get_facts(cik: str):
     try:
-        r = requests.get(
-            f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json',
-            headers=HEADERS, timeout=30
-        )
-        if r.status_code == 200:
+        r = _edgar_get(f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json', timeout=30)
+        if r and r.status_code == 200:
             return r.json()
     except:
         pass
@@ -235,11 +257,8 @@ def get_submissions(cik: str):
     Added Batch 7h.20 to fix silent sector-bucket misclassification.
     """
     try:
-        r = requests.get(
-            f'https://data.sec.gov/submissions/CIK{cik}.json',
-            headers=HEADERS, timeout=30
-        )
-        if r.status_code == 200:
+        r = _edgar_get(f'https://data.sec.gov/submissions/CIK{cik}.json', timeout=30)
+        if r and r.status_code == 200:
             return r.json()
     except:
         pass
