@@ -814,6 +814,7 @@ def _build_price_only_response(ticker: str, mkt: dict, window: int):
         'cash_flow':        None,
         'traditional':      None,
         'quarterly_history': None,
+        'usable_quarters':   0,
         'sector_metrics':   None,
 
         # Series trajectories also unavailable
@@ -824,6 +825,22 @@ def _build_price_only_response(ticker: str, mkt: dict, window: int):
         'news': [],
     }
     return response
+
+
+def _usable_quarters(raw) -> int:
+    """Count of usable quarters of fundamental history (max over core flow series).
+    Gates insufficient_history downstream. Revenue is primary; net_interest_income
+    covers banks. Fall back to the max across core series."""
+    candidates = ['revenue', 'net_income', 'operating_income', 'cfo',
+                  'net_interest_income']
+    best = 0
+    for k in candidates:
+        s = raw.get(k)
+        if s is not None:
+            n = len(s.dropna())
+            if n > best:
+                best = n
+    return best
 
 
 def _build_quarterly_history(raw, n_quarters=12):
@@ -2025,7 +2042,7 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
         # Batch 7h.10: quarterly history arrays for time-series rendering.
         # Each entry is a list of {date, val} dicts, oldest-to-newest, up to last 12 quarters.
         'quarterly_history': _build_quarterly_history(raw),
-
+        'usable_quarters':   _usable_quarters(raw),
 
         'traditional': {
             'altman_z':        {'val': altman,      'label': 'Altman Z-Score',     'simple': 'Classic 5-ratio bankruptcy predictor. Above 3 safe. Below 1.81 distress.',    'rating': R(altman, 'altman_z'),      'plain': plain_z(altman)},
