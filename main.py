@@ -2105,6 +2105,7 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
 @app.get("/health")
 async def health():
     return {"status": "ok", "yfinance": HAS_YF}
+# TODO: route through price_data source-tests instead of hardcoded vendor URLs
 @app.get("/diagnose")
 async def diagnose(ticker: str = "AAPL"):
     import traceback

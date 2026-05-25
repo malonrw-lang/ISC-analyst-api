@@ -2,6 +2,13 @@
 Daily price data fetcher with multi-source fallback.
 ==================================================
 
+SINGLE PRICE BOUNDARY. The rest of the system depends ONLY on
+fetch_daily_prices(ticker, days) -> (pd.Series | None, source_tag).
+Analytics consume the Series and are vendor-agnostic. To add a data source:
+add a _fetch_<vendor>(ticker, days) -> pd.Series | None function and insert
+it into the fetch_daily_prices fallback chain. Do NOT call vendor price APIs
+anywhere else in the codebase.
+
 Sources tried in order:
   1. Tiingo (preferred) — requires TIINGO_TOKEN env var, free tier 500 req/day
   2. Stooq (fallback)   — no auth, free, CSV format
