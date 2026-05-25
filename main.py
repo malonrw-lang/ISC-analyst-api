@@ -571,7 +571,7 @@ def get_market_data(ticker: str):
     }
     
     # 1. Daily prices via Tiingo→Stooq fallback chain
-    full_prices, price_source = fetch_daily_prices(ticker, days=1825)
+    full_prices, price_source = fetch_daily_prices(ticker, days=400)
     out['price_source'] = price_source
     
     if full_prices is not None and len(full_prices) > 0:

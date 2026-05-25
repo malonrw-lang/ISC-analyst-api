@@ -28,7 +28,7 @@ UA_BROWSER = {
 }
 
 
-def _fetch_tiingo(ticker: str, days: int = 730) -> Optional[pd.Series]:
+def _fetch_tiingo(ticker: str, days: int = 400) -> Optional[pd.Series]:
     """
     Fetch daily adjusted close prices from Tiingo.
     Returns Series indexed by date, or None on failure.
@@ -45,35 +45,37 @@ def _fetch_tiingo(ticker: str, days: int = 730) -> Optional[pd.Series]:
         'startDate': start_date.strftime('%Y-%m-%d'),
         'endDate':   end_date.strftime('%Y-%m-%d'),
         'token':     TIINGO_TOKEN,
-        'format':    'json',
+        'format':    'csv',
+        'columns':   'date,adjClose,adjVolume',
     }
-    
+
     try:
-        r = requests.get(url, params=params, timeout=TIMEOUT_SEC,
-                         headers={'Content-Type': 'application/json'})
+        r = requests.get(url, params=params, timeout=TIMEOUT_SEC)
         if r.status_code != 200:
             return None
-        data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
+
+        df = pd.read_csv(io.StringIO(r.text))
+        if df.empty:
             return None
-        
-        df = pd.DataFrame(data)
-        if 'adjClose' not in df.columns or 'date' not in df.columns:
+
+        # Normalise column names to lowercase for header-casing resilience
+        df.columns = [c.strip().lower() for c in df.columns]
+        if 'adjclose' not in df.columns or 'date' not in df.columns:
             return None
-        
+
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date')
-        df = df[df['adjClose'] > 0]
-        
+        df = df[df['adjclose'] > 0]
+
         if len(df) < 30:
             return None
-        
-        return pd.Series(df['adjClose'].values, index=df['date'].values)
+
+        return pd.Series(df['adjclose'].values, index=df['date'].values)
     except Exception:
         return None
 
 
-def _fetch_stooq(ticker: str, days: int = 730) -> Optional[pd.Series]:
+def _fetch_stooq(ticker: str, days: int = 400) -> Optional[pd.Series]:
     """
     Fetch daily prices from Stooq (CSV download).
     Stooq returns full available history; we trim to the requested window.
@@ -115,7 +117,7 @@ def _fetch_stooq(ticker: str, days: int = 730) -> Optional[pd.Series]:
         return None
 
 
-def fetch_daily_prices(ticker: str, days: int = 730) -> Tuple[Optional[pd.Series], str]:
+def fetch_daily_prices(ticker: str, days: int = 400) -> Tuple[Optional[pd.Series], str]:
     """
     Fetch daily prices using fallback chain.
     
