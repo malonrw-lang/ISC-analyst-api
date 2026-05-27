@@ -80,7 +80,7 @@ TAG_MAP = {
     'accounts_payable':   ['AccountsPayableCurrent'],
     'short_term_debt':    ['ShortTermBorrowings','DebtCurrent'],
     'long_term_debt':     ['LongTermDebt','LongTermDebtNoncurrent'],
-    'total_equity':       ['StockholdersEquity','StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest'],
+    'total_equity':       ['StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest','StockholdersEquity'],
     'retained_earnings':  ['RetainedEarningsAccumulatedDeficit'],
     'cfo':                ['NetCashProvidedByUsedInOperatingActivities','NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
     'capex':              ['PaymentsToAcquirePropertyPlantAndEquipment',
