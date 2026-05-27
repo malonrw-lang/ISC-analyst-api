@@ -1440,8 +1440,6 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
     std  = last(raw.get('short_term_debt'))
     tl   = last(raw.get('total_liabilities'))
     te   = last(raw.get('total_equity'))
-    tl   = last(raw.get('total_liabilities'))
-    te   = last(raw.get('total_equity'))
     # Batch 7h.17: total_liabilities is derived from the accounting identity
     # (Assets = Liabilities + Equity) -> tl = ta - te, preferred over the tagged
     # Liabilities XBRL value. Verified across the S&P 500: when the Liabilities
