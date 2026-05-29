@@ -281,12 +281,92 @@ def _shape_response(row: Dict[str, Any], obs_date_source: str = 'latest_availabl
         'quarter_labels': _quarter_labels(row.get('obs_date') or ''),
         'closest_aligned_framework_8q': row.get('closest_aligned_framework_8q'),
     }
+
+    # Peer-stable cohort: same sector_bucket + obs_date, isc_regime=='stable',
+    # excludes subject. Threshold-gated to avoid misleading 1-peer averages.
+    peer_quarterly, peer_count = _compute_peer_stable_cohort(row, response['ticker'])
+    response['peer_stable_quarterly_returns'] = peer_quarterly
+    response['peer_stable_count'] = peer_count
     return response
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Route attachment
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Peer-stable cohort computation
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# For a given subject (ticker, obs_date), the "peer-stable cohort" is the set
+# of OTHER tickers in the same sector_bucket on the same obs_date that were
+# classified isc_regime == "stable". The cohort's quarterly returns are the
+# arithmetic mean of each q1..q12 across cohort members.
+#
+# Pure dict-walk over _BACKTEST_DATA; no I/O. Typical cohort size is 5-30
+# names for major sectors, so cost is negligible.
+#
+# Dedupe note: each (ticker, obs_date) appears once in the nested store via
+# load_backtest_data() collapsing horizon rows to a single representative.
+# But the source CSV has 5 horizon rows per (ticker, obs_date); q1..q12 are
+# identical across those rows. Trust the nested-dict dedupe.
+
+_MIN_PEERS_THRESHOLD = 3
+_PEER_STABLE_REGIME_KEY = "stable"
+
+
+def _compute_peer_stable_cohort(subject_row, subject_ticker):
+    """Return (peer_quarterly_returns, peer_count) or (None, 0) if insufficient.
+
+    peer_quarterly_returns is a list of length 12 (averages of q1..q12 across
+    the cohort), or None when fewer than _MIN_PEERS_THRESHOLD peers qualify.
+    """
+    subject_sector = subject_row.get("sector")
+    subject_obs_date = subject_row.get("obs_date")
+
+    if not subject_sector or not subject_obs_date:
+        return (None, 0)
+
+    # Walk the nested store. Skip subject ticker (excluded from own cohort).
+    # Filter on `sector` (proper GICS classification), NOT `sector_bucket`
+    # (which is a too-coarse internal bucket producing meaningless cohorts
+    # of 170+ names; verified Day 23 via verify_peer_by_sector.py).
+    cohort_rows = []
+    for peer_ticker, dates_dict in _BACKTEST_DATA.items():
+        if peer_ticker == subject_ticker.upper():
+            continue
+        peer_row = dates_dict.get(subject_obs_date)
+        if peer_row is None:
+            continue
+        if peer_row.get("sector") != subject_sector:
+            continue
+        if peer_row.get("isc_regime") != _PEER_STABLE_REGIME_KEY:
+            continue
+        cohort_rows.append(peer_row)
+
+    if len(cohort_rows) < _MIN_PEERS_THRESHOLD:
+        return (None, len(cohort_rows))
+
+    # Average q1..q12 across cohort, treating non-numeric/missing as drop.
+    peer_quarterly = []
+    for q in range(1, 13):
+        key = f"q{q}_return"
+        values = []
+        for row in cohort_rows:
+            v = row.get(key)
+            if v is None or v == "":
+                continue
+            try:
+                values.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        if not values:
+            peer_quarterly.append(None)
+        else:
+            peer_quarterly.append(sum(values) / len(values))
+
+    return (peer_quarterly, len(cohort_rows))
+
 
 def attach_backtest_routes(app):
     """Add /backtest/{ticker}, /backtest/{ticker}/obs_dates, /backtest_status,
