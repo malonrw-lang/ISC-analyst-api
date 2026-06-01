@@ -1980,6 +1980,7 @@ async def analyze(ticker: str, window: int = 12, mode: str = "edgar"):
 
     result = {
         'ticker':       ticker,
+        'cik':          cik,  # EDGAR-resolved CIK, zero-padded 10-digit (from get_cik)
         'company_name': mkt.get('company_name', ticker),
         'analysis_mode': 'edgar',  # Batch 7h.14: explicit mode flag for frontend
         'window':       window,    # Batch 7h.15: quarters used for trajectory analysis
